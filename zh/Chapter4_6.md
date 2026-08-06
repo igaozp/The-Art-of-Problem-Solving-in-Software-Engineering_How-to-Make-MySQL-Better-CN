@@ -8,13 +8,13 @@
 
 ![](../media/4daa989affba4bd90fadec0d4236343a.png)
 
-图 4-23. 使用改进的 Mencius 协议测试 Group Replication 的架构。
+图 4-23. 使用改进的 Mencius 协议测试 组复制的架构。
 
 集群的 Paxos 算法采用改进的 Mencius 方法，去除了批处理和流水线，使其类似于纯 Paxos。在 10ms 网络延迟下进行了不同并发级别的测试，如下图所示：
 
 <img src="../media/image-20240830114557281.png" alt="image-20240830114557281" style="zoom:150%;" />
 
-图 4-24. 使用改进的 Mencius 协议测试 Group Replication 的结果。
+图 4-24. 使用改进的 Mencius 协议测试 组复制的结果。
 
 在 WAN 测试场景中，无论并发级别是 50、100 还是 150，吞吐量几乎保持恒定，因为 MySQL 处理 TPC-C 事务所需的时间与 10ms 的网络延迟相比可以忽略不计。网络延迟主导了整体事务时间，使得并发变化的影响相对不显著。
 

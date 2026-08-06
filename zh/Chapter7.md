@@ -522,7 +522,7 @@ Date:   Wed May 6 16:32:13 2020 +0200
 
 从MySQL 8.0.20开始，支持binlog压缩，但默认情况下禁用。可以使用*binlog_transaction_compression*参数启用它，并且可以使用*binlog_transaction_compression_level_zstd*参数调整*zstd*压缩级别，默认级别为3。
 
-使用同一数据中心内的Group Replication集群，使用BenchmarkSQL检查binlog压缩对TPC-C吞吐量和并发性的影响。主节点和辅助节点都配置了*binlog_transaction_compression*参数。具体测试结果如下图所示：
+使用同一数据中心内的组复制集群，使用BenchmarkSQL检查binlog压缩对TPC-C吞吐量和并发性的影响。主节点和辅助节点都配置了*binlog_transaction_compression*参数。具体测试结果如下图所示：
 
 <img src="../media/image-20240829101915930.png" alt="image-20240829101915930" style="zoom:150%;" />
 

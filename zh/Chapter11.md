@@ -32,33 +32,33 @@ Profile-guided optimization (PGO，配置文件引导优化）通常可以提高
 
 从图中可以明显看出，PGO 在 SMP 环境中实现了高达 30% 的最大性能提升，而在 NUMA 环境中，性能提升随着并发的增加而减少。这表明 PGO 在 SMP 环境中具有更大的潜力。
 
-继续分析，研究了 PGO 在 Group Replication 集群环境中与单个 MySQL 实例相比的性能表现。下图描述了 Group Replication 的简化队列模型。
+继续分析，研究了 PGO 在 组复制集群环境中与单个 MySQL 实例相比的性能表现。下图描述了 组复制的简化队列模型。
 
 ![](../media/2eba13133f9eb007d89459cce5d4055b.png)
 
-图 11-5. Group Replication 的简化队列模型。
+图 11-5. 组复制的简化队列模型。
 
 由于网络部分无法被 PGO 优化，与单个 MySQL 实例相比，MySQL 主节点消耗的时间比例较低。根据 Amdahl 定律，PGO 带来的性能提升将不如单机 MySQL 实例明显。通常，随着网络延迟的增加，PGO 的改进效果趋于减弱。
 
-下图比较了单机 MySQL 实例和 Group Replication 使用 PGO 的吞吐量提升。
+下图比较了单机 MySQL 实例和 组复制使用 PGO 的吞吐量提升。
 
 <img src="../media/image-20240829114100020.png" alt="image-20240829114100020" style="zoom:150%;" />
 
-图 11-6. Group Replication 与单机 MySQL 中 PGO 的性能提升对比。
+图 11-6. 组复制与单机 MySQL 中 PGO 的性能提升对比。
 
-从图中可以看出，PGO 在 Group Replication 集群环境中的性能提升通常小于单机 MySQL 实例。
+从图中可以看出，PGO 在 组复制集群环境中的性能提升通常小于单机 MySQL 实例。
 
 总之，PGO 可以总结如下：
 
 1. 对于 MySQL 而言，PGO 是一项值得采用的优化，理论上可以全面提升性能，特别是在 SMP 环境中。
 2. 在 NUMA 环境中，需要解决可扩展性问题才能从 PGO 中获得显著收益。
-3. PGO 在 Group Replication 集群中的效果不如单机 MySQL 实例明显。
+3. PGO 在 组复制集群中的效果不如单机 MySQL 实例明显。
 
 ## 11.2 最小化网络交互
 
 为了在不影响 TPC-C 测试正确性的前提下提高 MySQL 应用性能，修改 SQL 交互方式以减少客户端与 MySQL 之间的网络交互次数。这种优化可以间接提升性能。
 
-以下示例使用优化的 tpcc-mysql 测试工具来确定在特定软硬件条件下 Group Replication 支持的最大吞吐量。
+以下示例使用优化的 tpcc-mysql 测试工具来确定在特定软硬件条件下 组复制支持的最大吞吐量。
 
 ```
  [warehouse]: 200
@@ -103,7 +103,7 @@ STOPPING THREADS................................................................
                  1066021.000 TpmC
 ```
 
-数据表明，在给定的软硬件测试环境中，Group Replication 实现了 106.6 万 tpmC 的峰值吞吐量，创下了新纪录。
+数据表明，在给定的软硬件测试环境中，组复制实现了 106.6 万 tpmC 的峰值吞吐量，创下了新纪录。
 
 这突显了在应用开发过程中减少与 MySQL 的网络交互次数可以显著提升性能。
 
@@ -117,15 +117,15 @@ MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试�
 
 从图中可以明显看出，jemalloc 4.5 在性能上优于 jemalloc 3.6。
 
-对于 MySQL 从节点重放，请参考下图：
+对于 MySQL 从节点回放，请参考下图：
 
 <img src="../media/image-20240829114557565.png" alt="image-20240829114557565" style="zoom:150%;" />
 
-图 11-8. 使用 jemalloc 4.5 获得更好的重放速度。
+图 11-8. 使用 jemalloc 4.5 获得更好的回放速度。
 
-对优化后的 MySQL 重放进行测试显示，jemalloc 3.6 和 jemalloc 4.5 之间存在显著差异。该图展示了使用 jemalloc 4.5 后平衡重放速度的显著提升。
+对优化后的 MySQL 回放进行测试显示，jemalloc 3.6 和 jemalloc 4.5 之间存在显著差异。该图展示了使用 jemalloc 4.5 后平衡回放速度的显著提升。
 
-高效的内存分配工具不仅可以提升 MySQL 主服务器性能，还可以改善 MySQL 从节点的重放速度。
+高效的内存分配工具不仅可以提升 MySQL 主库性能，还可以改善 MySQL 从节点的回放速度。
 
 ## 11.4 索引与性能
 
@@ -155,7 +155,7 @@ MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试�
 
 ![](../media/a3767cf99551c83f2db7f46d52b340d3.png)
 
-重要的是要注意，随着 MySQL 8.0 中可扩展性的提升以及 redo log 处理的优化，在高并发测试场景中，禁用"双一"设置对 MySQL 主服务器吞吐量的影响已经减弱。
+重要的是要注意，随着 MySQL 8.0 中可扩展性的提升以及 redo log 处理的优化，在高并发测试场景中，禁用"双一"设置对 MySQL 主库吞吐量的影响已经减弱。
 
 首先使用 MySQL 8.0.27 进行对比测试。下图展示了启用和禁用"双一"时吞吐量与并发的关系。
 
@@ -173,13 +173,13 @@ MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试�
 
 还可以观察到，性能提升的程度随吞吐量而变化，并非恒定。随着 MySQL 可扩展性瓶颈的解决，"双一"的影响逐渐减小。
 
-由于诸如 *replica_preserve_commit_order* 排队等机制，"双一"对 MySQL 从节点重放的影响更加明显。下图比较了使用优化的 MySQL 版本在禁用"双一"前后 MySQL 从节点的平衡重放速度。
+由于诸如 *replica_preserve_commit_order* 排队等机制，"双一"对 MySQL 从节点回放的影响更加明显。下图比较了使用优化的 MySQL 版本在禁用"双一"前后 MySQL 从节点的平衡回放速度。
 
 <img src="../media/image-20240829115125819.png" alt="image-20240829115125819" style="zoom:150%;" />
 
-图 11-11. 关闭"双一"获得更好的重放速度。
+图 11-11. 关闭"双一"获得更好的回放速度。
 
-在相同条件下，禁用"双一"使 MySQL 从节点实现了 81 万 tpmC 的平衡重放速度，而启用"双一"将此速度降低到约 70 万 tpmC。因此，禁用"双一"显著提升了 MySQL 从节点的重放速度。
+在相同条件下，禁用"双一"使 MySQL 从节点实现了 81 万 tpmC 的平衡回放速度，而启用"双一"将此速度降低到约 70 万 tpmC。因此，禁用"双一"显著提升了 MySQL 从节点的回放速度。
 
 请注意，上述测试结果是在高性能 SSD 环境中获得的，SSD 硬件性能的差异可能导致不同的结果。
 
@@ -267,23 +267,23 @@ MySQL 默认启用 *binlog_order_commits*。值得注意的是，禁用 *binlog_
 
 ### 11.5.5 全面理解 Performance Schema 对性能的影响
 
-Performance Schema 通过进行实际测量而非猜测来帮助 DBA 调优性能。不幸的是，在 NUMA 环境中，启用 Performance Schema 会影响 MySQL 的性能，特别是影响 MySQL 从节点重放。下图使用 BenchmarkSQL 比较了不同并发级别下的 TPC-C 吞吐量以分析这种影响。
+Performance Schema 通过进行实际测量而非猜测来帮助 DBA 调优性能。不幸的是，在 NUMA 环境中，启用 Performance Schema 会影响 MySQL 的性能，特别是影响 MySQL 从节点回放。下图使用 BenchmarkSQL 比较了不同并发级别下的 TPC-C 吞吐量以分析这种影响。
 
 <img src="../media/image-20240829115606145.png" alt="image-20240829115606145" style="zoom:150%;" />
 
 图 11-19. 关闭 performance_schema 获得更好的性能。
 
-从图中可以看出，Performance Schema 对 MySQL 主节点性能的影响相对较小，用户通常可以接受。然而，启用 Performance Schema 会显著影响 MySQL 从节点的重放速度。下图显示了启用 Performance Schema 后 Group Replication 重放队列大小的变化。
+从图中可以看出，Performance Schema 对 MySQL 主节点性能的影响相对较小，用户通常可以接受。然而，启用 Performance Schema 会显著影响 MySQL 从节点的回放速度。下图显示了启用 Performance Schema 后 组复制回放队列大小的变化。
 
 ![](../media/2e14f81ddb33dc7a1db1d7f41e69dcdd.png)
 
-图 11-20. 启用 Performance Schema 后 Group Replication 中的重放队列大小增加。
+图 11-20. 启用 Performance Schema 后 组复制中的回放队列大小增加。
 
-从图中可以观察到重放队列大小正在增加，表明 MySQL 从节点无法跟上 MySQL 主节点的处理速度。在 MySQL 主节点上执行后的吞吐量结果如下：
+从图中可以观察到回放队列大小正在增加，表明 MySQL 从节点无法跟上 MySQL 主节点的处理速度。在 MySQL 主节点上执行后的吞吐量结果如下：
 
 ![](../media/42665a7506959bdefa1b451ce564a261.png)
 
-MySQL 主节点完成执行后，以下是在 MySQL 从节点重放过程中捕获的性能截图：
+MySQL 主节点完成执行后，以下是在 MySQL 从节点回放过程中捕获的性能截图：
 
 ![](../media/9b468bff3f312fa70821da3a0a117f70.png)
 
@@ -291,19 +291,19 @@ MySQL 主节点完成执行后，以下是在 MySQL 从节点重放过程中捕�
 
 从绿色高亮框中可以明显看出，存在与 Performance Schema 相关的重大瓶颈。
 
-总结上述测试结果：当 MySQL 主节点实现 50 万 tpmC 的吞吐量时，启用 Performance Schema 的 MySQL 从节点显示出明显的瓶颈。此外，MySQL 从节点在重放过程中无法跟上 MySQL 主节点的速度。
+总结上述测试结果：当 MySQL 主节点实现 50 万 tpmC 的吞吐量时，启用 Performance Schema 的 MySQL 从节点显示出明显的瓶颈。此外，MySQL 从节点在回放过程中无法跟上 MySQL 主节点的速度。
 
 现在，禁用 Performance Schema，进行相同的并发测试。具体结果见下图：
 
 ![](../media/74a2f4f519d0991c114aabf3318369b2.png)
 
-图 11-22. 禁用 Performance Schema 后 Group Replication 中的重放队列大小不会增加。
+图 11-22. 禁用 Performance Schema 后 组复制中的回放队列大小不会增加。
 
-该图表明，等待重放的事务数量并未随时间显著增加。MySQL 主节点完成执行后的吞吐量结果如下：
+该图表明，等待回放的事务数量并未随时间显著增加。MySQL 主节点完成执行后的吞吐量结果如下：
 
 ![](../media/468b1638646ec6ce6ae997ec6e52f152.png)
 
-当 MySQL 主节点测试完成时，MySQL 从节点几乎同时完成重放。这表明在主流 NUMA 环境中，Performance Schema 对 MySQL 从节点重放极为不利。Performance Schema 的 NUMA 兼容性问题尚未解决，将成为未来优化的重点。
+当 MySQL 主节点测试完成时，MySQL 从节点几乎同时完成回放。这表明在主流 NUMA 环境中，Performance Schema 对 MySQL 从节点回放极为不利。Performance Schema 的 NUMA 兼容性问题尚未解决，将成为未来优化的重点。
 
 ### 11.5.6 Doublewrite 对性能的影响
 
@@ -335,7 +335,7 @@ doublewrite 缓冲区是一个存储区域，InnoDB 在将页面从缓冲池提�
 
 图 11-24. 使用最小日志记录获得改进的吞吐量。
 
-从图中可以观察到，使用 *binlog_row_image=minimal* 为 MySQL 主节点提供了适度的吞吐量提升，但增幅并不显著。关于 MySQL 从节点重放，具体细节可以在第 10.3.7 节中找到。
+从图中可以观察到，使用 *binlog_row_image=minimal* 为 MySQL 主节点提供了适度的吞吐量提升，但增幅并不显著。关于 MySQL 从节点回放，具体细节可以在第 10.3.7 节中找到。
 
 ### 11.5.8 理解 Binlog 压缩设置对性能的影响
 
@@ -345,13 +345,13 @@ doublewrite 缓冲区是一个存储区域，InnoDB 在将页面从缓冲池提�
 
 启用二进制日志事务压缩后，事务有效负载会被压缩并作为单个事件写入二进制日志。这些压缩的有效负载在复制流和中继日志中保持压缩状态，减少了存储需求并节省了事务发起者和接收者的网络带宽 [13]。
 
-在同一数据中心内的 Group Replication 集群中，为 MySQL 主节点和从节点启用 *binlog_transaction_compression*，让我们分析二进制日志压缩对 TPC-C 吞吐量的影响。详细结果请参考下图：
+在同一数据中心内的 组复制集群中，为 MySQL 主节点和从节点启用 *binlog_transaction_compression*，让我们分析二进制日志压缩对 TPC-C 吞吐量的影响。详细结果请参考下图：
 
 <img src="../media/image-20240829115724267.png" alt="image-20240829115724267" style="zoom:150%;" />
 
 图 11-25. 在 LAN 环境中 Binlog 压缩可能对性能产生负面影响。
 
-从图中可以明显看出，启用 binlog 压缩会导致 Group Replication 集群的吞吐量显著下降，特别是在高并发情况下。当压缩的网络收益被所涉及的计算成本所抵消时，就会出现这种下降。
+从图中可以明显看出，启用 binlog 压缩会导致 组复制集群的吞吐量显著下降，特别是在高并发情况下。当压缩的网络收益被所涉及的计算成本所抵消时，就会出现这种下降。
 
 为了研究增加网络延迟是否可以改善压缩后的吞吐量，使用了 10ms 的模拟网络延迟。binlog 压缩前后 TPC-C 吞吐量与并发级别的比较如下图所示。
 
