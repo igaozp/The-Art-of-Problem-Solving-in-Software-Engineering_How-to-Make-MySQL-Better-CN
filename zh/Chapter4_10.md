@@ -42,7 +42,7 @@ SQL 注入是数据库的常见且有害的漏洞。攻击者可以利用此漏�
 create index bmsql_oorder_index on bmsql_oorder (o_c_id);
 ```
 
-创建附加索引是为了提高 TPC-C 吞吐量。下图显示了添加索引前后 TPC-C 吞吐量与并发之间的关系。
+创建附加索引是为了提高 TPC-C 吞吐量。下图给出添加索引前后 TPC-C 吞吐量与并发之间的关系。
 
 <img src="../media/image-20240829090305653.png" alt="image-20240829090305653" style="zoom:150%;" />
 

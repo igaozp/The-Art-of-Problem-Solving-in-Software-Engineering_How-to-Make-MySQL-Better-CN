@@ -2,19 +2,19 @@
 
 ## 10.1 MySQL 从库回放机制
 
-MySQL 支持主从复制（primary/secondary replication），通常使用日志传输（log shipping）。一个复制的 MySQL 实例由一个主库和一个或多个从库组成。事务首先在主库上执行。主库生成记录这些事务所执行操作的日志，并将日志条目传输到从库。从库按串行顺序回放日志条目，以达到与主库相同的状态 [16]。
+MySQL 支持主从复制（primary/secondary），常见做法是日志传输（log shipping）：事务先在主库执行，主库把操作写入日志并发送给从库；从库按序回放，使状态与主库一致 [16]。
 
-需要注意的是，上述讨论的 MySQL 从库回放机制是指按照事务提交的顺序回放事务。在提交之前相互之间没有冲突的事务可以并行执行。
+这里说的回放，指按提交顺序回放事务；提交前互不冲突的事务可以并行。
 
-无论使用异步复制（asynchronous replication）、半同步复制（semisynchronous replication）还是组复制（Group Replication），它们都遵循相同的回放流程。MySQL 从库回放必须确保正确的回放、支持一致性读取，并且要快速以实现高可用性。因此，MySQL 从库实例高质量回放事务的能力对集群性能很关键。
+异步复制、半同步与组复制（Group Replication）的回放流程本质相同。从库回放必须正确、支持一致读，并且要足够快，高可用才站得住——从库回放质量直接决定集群表现。
 
 ### 10.1.1 确保回放正确性
 
-为了确保正确的回放，需要在事务之间建立依赖关系。如果两个事务之间存在冲突，则必须确定回放顺序——具体来说，哪个事务应该先回放，哪个应该随后回放。这些依赖关系基于 binlog 或 relay log 文件中的事务顺序。
+正确回放依赖事务间依赖关系：有冲突时必须定先后，依赖来自 binlog/relay log 中的事务顺序。
 
-一旦建立了依赖关系，确保回放的幂等性（idempotence）就很关键。这个属性特别重要，尤其是在崩溃恢复等场景中，以保证事务可以正确且一致地回放，而不会产生意外的副作用。
+此外还要保证幂等（idempotence），崩溃恢复等场景尤其重要，避免重复应用带来副作用。
 
-为了确保基于 GTID 的 MySQL 从库回放的幂等性，请参见下面的具体代码：
+基于 GTID 保证幂等的关键逻辑如下：
 
 ```c++
   const bool skip_transaction = is_already_logged_transaction(thd);
@@ -83,7 +83,7 @@ MySQL 从库回放的执行过程与主库不同。虽然从库回放专注于�
 
 如图所示，MySQL 主库上的 CPU 消耗明显高于 MySQL 从库。这表明对于数据加载，包括处理大事务，MySQL 从库显示出非常高的执行效率。相比之下，MySQL 主库在处理大事务方面可能还有进一步的优化机会。
 
-接下来 MySQL 主库加载 1000 个仓库的 TPC-C 数据所需的时间。具体统计结果如下图所示：
+接下来 MySQL 主库加载 1000 个仓库的 TPC-C 数据所需的时间。具体统计结果见下图：
 
 <img src="../media/image-20240829112326190.png" alt="image-20240829112326190" style="zoom:150%;" />
 
@@ -98,7 +98,7 @@ MySQL 从库回放的执行过程与主库不同。虽然从库回放专注于�
 
 ### 10.1.4 MySQL 从库的理论最大回放速度
 
-论文 "Scalable Replay-Based Replication For Fast Databases" 描述了回放障碍（replay barrier）[18]：
+论文 "Scalable Replay-Based Replication For Fast Databases" 说明了回放障碍（replay barrier）[18]：
 
 一个重大挑战是从库通过按串行顺序回放数据库日志来确保与主库的一致性。这种回放难以并发执行，因此从库性能可能无法随主库性能扩展。
 
@@ -130,7 +130,7 @@ MySQL 从库上的事务回放过程包括两个主要阶段：
 
 ### 10.2.1 MySQL 从库回放的队列模型
 
-这里进一步细化了 MySQL 从库回放的队列模型，如下所示：
+这里进一步细化了 MySQL 从库回放的队列模型，如下：
 
 ![](../media/4e3a6edca9e2bdafe7dd69fbdf76c8db.png)
 
@@ -150,9 +150,9 @@ SQL 线程的速度需要灵活；如果太慢，事件无法及时回放；如�
 
 ### 10.2.2 瓶颈分析
 
-在 MySQL 异步复制中，从库有两个线程：IO 线程从主库读取日志条目并将其存储在本地磁盘上，而 SQL 线程从本地磁盘读取日志并回放事件。单个线程按顺序解析和执行日志事件。当解析行事件时，它包括操作类型和行镜像，这些以原始字节形式存储。SQL 线程必须将这些字节"解包"到字段中，在执行操作之前需要了解表模式。这种在将日志事件发送到多个线程进行回放之前的解包和检查是昂贵的，如果由单个线程处理可能成为瓶颈 [18]。具体来说，解包行镜像会消耗 SQL 线程的大量 CPU 资源，严重限制了 MySQL 从库回放性能。
+在 MySQL 异步复制中，从库有两个线程：IO 线程从主库读取日志条目并将其存储在本地磁盘上，而 SQL 线程从本地磁盘读取日志并回放事件。单个线程按顺序解析和执行日志事件。当解析行事件时，它包括操作类型和行镜像，这些以原始字节形式存储。SQL 线程必须将这些字节"解包"到字段中，在执行操作之前需要了解表模式。这种在将日志事件发送到多个线程进行回放之前的解包和检查是昂贵的，如果由单个线程处理可能成为瓶颈 [18]。具体而言，解包行镜像会消耗 SQL 线程的大量 CPU 资源，严重限制了 MySQL 从库回放性能。
 
-例如，在组复制从库回放期间，捕获到的主要瓶颈之一是 SQL 线程，具体显示在 *rpl_rca_sql-0* 线程中，如下图所示。
+例如，在组复制从库回放期间，捕获到的主要瓶颈之一是 SQL 线程，具体显示在 *rpl_rca_sql-0* 线程中，见下图。
 
 ![](../media/3b54c6545f0c49be73fd3afd9c6ffe79.gif)
 
@@ -247,9 +247,9 @@ bool Mts_submode_logical_clock::wait_for_last_committed_trx(
 }
 ```
 
-该代码描述了一种机制，如果记录的低水位标记（low-water-mark，LWM）——表示一个事务及其之前的所有事务都已提交——小于正在回放的事务的 last committed 值，则 SQL 线程会等待。在 MySQL 中，是 SQL 线程在等待，而不是 worker 线程。这种等待机制明显限制了回放速度。
+该代码说明了一种机制，如果记录的低水位标记（low-water-mark，LWM）——表示一个事务及其之前的所有事务都已提交——小于正在回放的事务的 last committed 值，则 SQL 线程会等待。在 MySQL 中，是 SQL 线程在等待，而不是 worker 线程。这种等待机制明显限制了回放速度。
 
-最后，下面看与 NUMA 环境中 MySQL 从库回放相关的问题。下图显示了 MySQL 从库回放的测试结果：
+最后，下面看与 NUMA 环境中 MySQL 从库回放相关的问题。下图给出 MySQL 从库回放的测试结果：
 
 <img src="../media/image-20240829112700824.png" alt="image-20240829112700824" style="zoom:150%;" />
 
@@ -283,7 +283,7 @@ bool Mts_submode_logical_clock::wait_for_last_committed_trx(
 
 对于大事务回放，主要问题在于 worker 队列太小，导致 SQL 线程频繁等待。
 
-为了解决这个问题，可以设置更大的队列大小，如下面的代码所示。
+为此，可以设置更大的队列大小，如下面的代码所示。
 
 ```c++
 /*
@@ -307,7 +307,7 @@ const ulong mts_slave_worker_queue_len_max = 16384 << 6;
 
 ### 10.3.3 优化调度线程机制
 
-如果在 MySQL 中时间上接近发生的两个事务修改相同的数据，它们可能在从库回放期间产生依赖关系。具体来说，后一个事务的 *last_committed* 值可能与前一个事务的 *sequence_number* 匹配。在 MySQL 从库回放期间，如果后一个事务依赖于尚未完成回放的前一个事务，调度线程将阻塞自己。这种方法效率低下，因为 worker 回放线程理想情况下应该处理这种等待，而不是调度线程。调度线程本身有很多其他任务要处理，并且无法保证后续事务不能及时回放。
+如果在 MySQL 中时间上接近发生的两个事务修改相同的数据，它们可能在从库回放期间产生依赖关系。具体而言，后一个事务的 *last_committed* 值可能与前一个事务的 *sequence_number* 匹配。在 MySQL 从库回放期间，如果后一个事务依赖于尚未完成回放的前一个事务，调度线程将阻塞自己。这种方法效率低下，因为 worker 回放线程理想情况下应该处理这种等待，而不是调度线程。调度线程本身有很多其他任务要处理，并且无法保证后续事务不能及时回放。
 
 为了更好地理解这个问题，请考虑以下情况：
 
@@ -325,11 +325,11 @@ const ulong mts_slave_worker_queue_len_max = 16384 << 6;
 
 如图所示，当并发达到 70 时，MySQL 从库落后于 MySQL 主库的处理速度。这种低效率主要是由于调度线程不必要的等待，这破坏了正常的回放过程。只要吞吐量低于 245,439 tpmC，MySQL 从库就能跟上主库。然而，一旦超过这个阈值，MySQL 从库就难以匹配主库的速度。本质上，MySQL 从库回放无法有效支持高吞吐量。
 
-为了解决这个问题，允许 worker 独立处理对 **last_committed** 事务的等待可以完全释放调度线程。这种调整为未来改进 MySQL 从库回放性能提供了坚实的基础。
+为此，允许 worker 独立处理对 **last_committed** 事务的等待可以完全释放调度线程。这种调整为未来改进 MySQL 从库回放性能提供了坚实的基础。
 
 ### 10.3.4 内存分配工具对回放性能的影响
 
-利用先进的内存分配工具可以提高 MySQL 从库的回放速度。下图显示了两个 jemalloc 版本在 x86 架构下对 MySQL 从库回放性能的影响。
+利用先进的内存分配工具可以提高 MySQL 从库的回放速度。下图给出两个 jemalloc 版本在 x86 架构下对 MySQL 从库回放性能的影响。
 
 <img src="../media/image-20240829113113252.png" alt="image-20240829113113252" style="zoom:150%;" />
 
@@ -355,7 +355,7 @@ const ulong mts_slave_worker_queue_len_max = 16384 << 6;
 
 图 10-19. pending_jobs_lock 的瓶颈已在 Performance Schema 中暴露。
 
-如图所示，在 NUMA 环境中，*Relay_log_info::pending_jobs_lock* 在与回放相关的重要性方面排名第五。将 MySQL 从库实例绑定到 NUMA 节点 0，测试评估在 SMP 环境下 Performance Schema 统计信息是否发生变化。具体测试结果如下图所示：
+如图所示，在 NUMA 环境中，*Relay_log_info::pending_jobs_lock* 在与回放相关的重要性方面排名第五。将 MySQL 从库实例绑定到 NUMA 节点 0，测试评估在 SMP 环境下 Performance Schema 统计信息是否发生变化。具体测试结果见下图：
 
 ![](../media/28708a58742f84033b84ff551cda3b1b.gif)
 
@@ -446,7 +446,7 @@ bool append_item_to_jobs(slave_job_item *job_item, Slave_worker *worker,
 
 ### 10.3.7 Binlog 行镜像格式对回放性能的影响
 
-减小 binlog 的大小理论上有助于提高 MySQL 回放速度。下图显示了使用 *binlog_row_image=minimal* 和 *binlog_row_image=full* 在平衡回放速度方面的比较：
+减小 binlog 的大小理论上有助于提高 MySQL 回放速度。下图给出使用 *binlog_row_image=minimal* 和 *binlog_row_image=full* 在平衡回放速度方面的比较：
 
 <img src="../media/image-20240829113734608.png" alt="image-20240829113734608" style="zoom:150%;" />
 
@@ -466,7 +466,7 @@ bool append_item_to_jobs(slave_job_item *job_item, Slave_worker *worker,
 
 ## 10.4 组复制中最大回放速度的探索
 
-使用修改后的 tpcc-mysql，高吞吐量测试可以识别组复制从库何时落后于 MySQL 主库。下图显示了详细的测试结果。测试设置包括：禁用"双一"，使用 jemalloc 4.5，在不同机器上部署 MySQL 从库和主库，将 binlog 行镜像格式设置为 minimal，并运行测试 300 秒。
+使用修改后的 tpcc-mysql，高吞吐量测试可以识别组复制从库何时落后于 MySQL 主库。下图给出详细的测试结果。测试设置包括：禁用"双一"，使用 jemalloc 4.5，在不同机器上部署 MySQL 从库和主库，将 binlog 行镜像格式设置为 minimal，并运行测试 300 秒。
 
 <img src="../media/image-20240829113824280.png" alt="image-20240829113824280" style="zoom:150%;" />
 
@@ -474,7 +474,7 @@ bool append_item_to_jobs(slave_job_item *job_item, Slave_worker *worker,
 
 该图说明了在并发级别为 100、150、200、300 和 400 时 MySQL 主库的吞吐量。在图中，浅灰色表示 MySQL 主库和从库的速度是同步的，而深灰色表示 MySQL 从库略微落后于 MySQL 主库。除了在 200 并发时观察到 2 秒延迟的情况外，MySQL 从库通常与主库保持同步。
 
-值得注意的是，最大回放速度与并发直接相关。在 150 并发时，吞吐量很高，延迟几乎为零，而在 200 并发时，吞吐量略有降低，延迟为 2 秒。
+需要注意，最大回放速度与并发直接相关。在 150 并发时，吞吐量很高，延迟几乎为零，而在 200 并发时，吞吐量略有降低，延迟为 2 秒。
 
 通过更好的硬件，最大回放速度可能会有进一步的提升，但测试结果已经非常接近可实现的最大值。
 

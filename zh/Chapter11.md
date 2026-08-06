@@ -1,24 +1,24 @@
 # 第11章：性能调优
 
-本章主要介绍在不修改 MySQL 源代码的情况下提升 MySQL 应用性能的方法。
+本章讨论在不改 MySQL 源码的前提下，如何提升应用侧性能。
 
 ## 11.1 PGO
 
-Profile-guided optimization （PGO，配置文件引导优化）通常可以提高程序执行效率。下图展示了在解决 MySQL MVCC ReadView 可扩展性问题后，PGO 如何提升单机 MySQL 实例在不同并发级别下的吞吐量。
+配置文件引导优化（Profile-Guided Optimization，PGO）常能提高程序效率。下图给出：在解决 MVCC ReadView 可扩展性问题后，PGO 对单机实例、不同并发下吞吐的影响。
 
 <img src="../media/image-20240829113916829.png" alt="image-20240829113916829" style="zoom:150%;" />
 
 图 11-1. 解决 MVCC ReadView 可扩展性问题后 PGO 的影响。
 
-如图所示，PGO 具有显著的影响。
+如图所示，PGO 收益清楚。
 
-对于使用 PGO 的 MySQL 8.0.27，在高并发条件下吞吐量会下降。具体细节如下图所示：
+但对已启用 PGO 的 8.0.27，高并发下吞吐仍可能掉下去，见下图：
 
 <img src="../media/image-20240829113948830.png" alt="image-20240829113948830" style="zoom:150%;" />
 
 图 11-2. MySQL 8.0.27 中使用 PGO 前后的性能对比测试。
 
-上述测试结果表明，PGO 对 MySQL 的改进需要先解决可扩展性问题，才能充分发挥其潜力。需要注意的是，上述两组对比测试都是在主流的 NUMA 环境中进行的。当 MySQL 绑定到单个 NUMA 节点，创建 SMP 环境时，下图显示了使用 PGO 前后 TPC-C 吞吐量与并发级别的关系。
+上述测试结果表明，PGO 对 MySQL 的改进需要先解决可扩展性问题，才能充分发挥其潜力。需要注意的是，上述两组对比测试都是在主流的 NUMA 环境中进行的。当 MySQL 绑定到单个 NUMA 节点，创建 SMP 环境时，下图给出使用 PGO 前后 TPC-C 吞吐量与并发级别的关系。
 
 <img src="../media/image-20240829114017540.png" alt="image-20240829114017540" style="zoom:150%;" />
 
@@ -32,7 +32,7 @@ Profile-guided optimization （PGO，配置文件引导优化）通常可以提�
 
 如图所示，PGO 在 SMP 环境中实现了高达 30% 的最大性能提升，而在 NUMA 环境中，性能提升随着并发的增加而减少。这表明 PGO 在 SMP 环境中具有更大的潜力。
 
-继续分析，研究了 PGO 在组复制集群环境中与单个 MySQL 实例相比的性能表现。下图描述了组复制的简化队列模型。
+继续分析，研究了 PGO 在组复制集群环境中与单个 MySQL 实例相比的性能表现。下图给出组复制的简化队列模型。
 
 ![](../media/2eba13133f9eb007d89459cce5d4055b.png)
 
@@ -109,7 +109,7 @@ STOPPING THREADS................................................................
 
 ## 11.3 使用先进的内存分配工具
 
-MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试数据表明，jemalloc 3.6 在性能方面并非最优。下图显示了在 x86 架构上 jemalloc 4.5 相比 jemalloc 3.6 的吞吐量提升。
+MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试数据表明，jemalloc 3.6 在性能方面并非最优。下图给出在 x86 架构上 jemalloc 4.5 相比 jemalloc 3.6 的吞吐量提升。
 
 <img src="../media/image-20240829114526325.png" alt="image-20240829114526325" style="zoom:150%;" />
 
@@ -123,13 +123,13 @@ MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试�
 
 图 11-8. 使用 jemalloc 4.5 获得更好的回放速度。
 
-对优化后的 MySQL 回放进行测试显示，jemalloc 3.6 和 jemalloc 4.5 之间存在显著差异。该图展示了使用 jemalloc 4.5 后平衡回放速度的明显提升。
+对优化后的 MySQL 回放进行测试显示，jemalloc 3.6 和 jemalloc 4.5 之间存在显著差异。该图给出了使用 jemalloc 4.5 后平衡回放速度的明显提升。
 
 高效的内存分配工具不仅可以提升 MySQL 主库性能，还可以改善 MySQL 从节点的回放速度。
 
 ## 11.4 索引与性能
 
-第 4.10.6 节提供了有关该主题的详细信息。
+第 4.10.6 节给出了该主题的详细信息。
 
 ## 11.5 影响性能的关键 MySQL 参数
 
@@ -157,7 +157,7 @@ MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试�
 
 重要的是要注意，随着 MySQL 8.0 中可扩展性的提升以及 redo log 处理的优化，在高并发测试场景中，禁用"双一"设置对 MySQL 主库吞吐量的影响已经减弱。
 
-首先使用 MySQL 8.0.27 进行对比测试。下图展示了启用和禁用"双一"时吞吐量与并发的关系。
+首先使用 MySQL 8.0.27 进行对比测试。下图给出启用和禁用"双一"时吞吐量与并发的关系。
 
 <img src="../media/image-20240829114945572.png" alt="image-20240829114945572" style="zoom:150%;" />
 
@@ -165,7 +165,7 @@ MySQL 默认使用 jemalloc 内存分配工具，特别是 3.6 版本。测试�
 
 根据该图，可以明显看出，在 MySQL 8.0.27 中，禁用"双一"明显提升了吞吐量。然而，这种性能提升随着并发的增加而减弱。
 
-基于使用 PGO 的改进版 MySQL，禁用"双一"后的性能提升不太明显，如下图所示：
+基于使用 PGO 的改进版 MySQL，禁用"双一"后的性能提升不太明显，见下图：
 
 <img src="../media/image-20240829115033197.png" alt="image-20240829115033197" style="zoom:150%;" />
 
@@ -225,7 +225,7 @@ spin delay 参数有助于解决 NUMA（非统一内存访问）兼容性问题�
 
 如图所示，当默认 *spin_delay* 参数设置为 6 时，吞吐量在 200 并发时急剧下降。然而，设置 *spin_delay=20* 会明显提升吞吐量。
 
-让我们继续进行 MVCC ReadView 优化以进一步提升 MySQL 可扩展性。下图显示了 MVCC ReadView 优化与 *spin delay=20* 之间的吞吐量比较：
+让我们继续进行 MVCC ReadView 优化以进一步提升 MySQL 可扩展性。下图给出 MVCC ReadView 优化与 *spin delay=20* 之间的吞吐量比较：
 
 <img src="../media/image-20240829115320081.png" alt="image-20240829115320081" style="zoom:150%;" />
 
@@ -263,7 +263,7 @@ MVCC ReadView 优化后，再次测试了 *spin_delay* 的影响。具体结果�
 
 图 11-18. binlog 组提交优化后，关闭 binlog_order_commits 带来的性能提升较少。
 
-MySQL 默认启用 *binlog_order_commits*。值得注意的是，禁用 *binlog_order_commits* 会影响 MySQL 的克隆功能。
+MySQL 默认启用 *binlog_order_commits*。需要注意，禁用 *binlog_order_commits* 会影响 MySQL 的克隆功能。
 
 ### 11.5.5 全面理解 Performance Schema 对性能的影响
 
@@ -273,7 +273,7 @@ Performance Schema 通过进行实际测量而非猜测来帮助 DBA 调优性�
 
 图 11-19. 关闭 performance_schema 获得更好的性能。
 
-如图所示，Performance Schema 对 MySQL 主节点性能的影响相对较小，用户通常可以接受。然而，启用 Performance Schema 会明显影响 MySQL 从节点的回放速度。下图显示了启用 Performance Schema 后组复制回放队列大小的变化。
+如图所示，Performance Schema 对 MySQL 主节点性能的影响相对较小，用户通常可以接受。然而，启用 Performance Schema 会明显影响 MySQL 从节点的回放速度。下图给出启用 Performance Schema 后组复制回放队列大小的变化。
 
 ![](../media/2e14f81ddb33dc7a1db1d7f41e69dcdd.png)
 
@@ -313,7 +313,7 @@ MySQL 主节点完成执行后，以下是在 MySQL 从节点回放过程中捕�
 
 doublewrite 缓冲区是一个存储区域，InnoDB 在将页面从缓冲池提交到数据文件之前将其写入该区域。此机制通过在发生故障时提供可靠的页面副本来确保崩溃恢复期间的数据完整性。然而，由于默认的 InnoDB 页面大小为 16 KB，而文件系统只能保证最多 4 KB 的原子性，因此可能只有部分页面可恢复。启用 doublewrite 有助于 InnoDB 通过两次写入来恢复完整页面。
 
-使用带有 PGO 的改进版 MySQL 8.0.27 评估启用 doublewrite 对性能的影响。下图显示了在不同并发级别下禁用 doublewrite 对 TPC-C 吞吐量的影响。
+使用带有 PGO 的改进版 MySQL 8.0.27 评估启用 doublewrite 对性能的影响。下图给出在不同并发级别下禁用 doublewrite 对 TPC-C 吞吐量的影响。
 
 <img src="../media/image-20240829115642934.png" alt="image-20240829115642934" style="zoom:150%;" />
 
@@ -353,7 +353,7 @@ doublewrite 缓冲区是一个存储区域，InnoDB 在将页面从缓冲池提�
 
 如图所示，启用 binlog 压缩会导致组复制集群的吞吐量明显下降，特别是在高并发情况下。当压缩的网络收益被所涉及的计算成本所抵消时，就会出现这种下降。
 
-为了研究增加网络延迟是否可以改善压缩后的吞吐量，使用了 10ms 的模拟网络延迟。binlog 压缩前后 TPC-C 吞吐量与并发级别的比较如下图所示。
+为了研究增加网络延迟是否可以改善压缩后的吞吐量，使用了 10ms 的模拟网络延迟。binlog 压缩前后 TPC-C 吞吐量与并发级别的比较见下图。
 
 <img src="../media/image-20240901103231333.png" alt="image-20240901103231333" style="zoom:150%;" />
 
@@ -371,7 +371,7 @@ doublewrite 缓冲区是一个存储区域，InnoDB 在将页面从缓冲池提�
 
 较大的缓冲池在内存中保留更多数据，减少了页面驱逐、I/O 操作和缓冲池内的竞争 [13]。
 
-基于使用 PGO 的改进版 MySQL 8.0.27，分析了 *innodb_buffer_pool_size* 参数在不同并发级别下对 TPC-C 吞吐量的影响。仓库数量为 1000 时的结果如下图所示。
+基于使用 PGO 的改进版 MySQL 8.0.27，分析了 *innodb_buffer_pool_size* 参数在不同并发级别下对 TPC-C 吞吐量的影响。仓库数量为 1000 时的结果见下图。
 
 <img src="../media/image-20240901104239714.png" alt="image-20240901104239714" style="zoom:150%;" />
 
@@ -379,7 +379,7 @@ doublewrite 缓冲区是一个存储区域，InnoDB 在将页面从缓冲池提�
 
 如图所示，增加缓冲池大小并不总是导致更高的吞吐量。对于 1000 个仓库，在测试中占用约 92GB 的 I/O 空间，将 *innodb_buffer_pool_size* 设置为 92GB 比设置为 192GB 性能更好。
 
-值得注意的是，*innodb_buffer_pool_size* 参数非常适合使用 AI 进行动态自适应调优。
+需要注意，*innodb_buffer_pool_size* 参数非常适合使用 AI 进行动态自适应调优。
 
 ## 11.6 总结
 
