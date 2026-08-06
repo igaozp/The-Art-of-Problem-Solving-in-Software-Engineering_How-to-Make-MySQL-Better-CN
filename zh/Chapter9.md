@@ -1,0 +1,881 @@
+# 第9章：Group Replication 的重大改进
+
+## 9.1 Group Replication 的重大设计缺陷
+
+Group Replication 最初设计时是在 SSD 尚未广泛采用之前。在 Paxos 层引入 I/O 操作可能会显著影响性能,因此最初的设计没有考虑将 Paxos 日志持久化到磁盘。
+
+Group Replication 采用了基于认证数据库的冲突检测方法来实现分布式环境中的并发控制,旨在支持任何 MySQL 节点上的写操作。这种方法忽略了 MySQL 单节点写入的固有特性,导致 Group Replication 的单主模式吞吐量不如半同步复制。
+
+在为多主场景设计 Group Replication 时,没有严格遵循状态机复制的原则,即所有节点的操作序列应该保持一致。这导致 Group Replication 的多主设置在某些场景下出现最终不一致问题。
+
+当 MySQL 从节点的回放卡住或其 I/O 存储空间用尽时,最终所有 Group Replication 节点都会受到影响,并且大多数节点可能会遇到内存溢出(Out Of Memory, OOM)问题。虽然 Group Replication 旨在解决高可用性问题,但它也应该确保自身的高可用性,防止由于单个 MySQL 从节点的问题导致整个集群不可用。
+
+这些设计缺陷通常只有通过暴露问题才能有效发现。Group Replication 的逻辑高度复杂,仅从代码中直接识别问题具有挑战性。
+
+### 9.1.1 缺乏持久性: Paxos 未提交到磁盘
+
+以下是 Meta 公司工程师对 Group Replication 的看法[42]:
+
+*另一个重要且深思熟虑的选择是不使用 MySQL 5.7 及更高版本提供的 Group Replication。虽然该协议提供了重大进步(例如多主模式),但在我们的部署中使用 Group Replication 面临着重大挑战。它基于 Paxos 的一个变体,该变体不使用持久化日志。条目只有在通过内存中的共识轮次被认为已提交后才会写入日志。领导者选举算法是本地的和确定性的。它在选择新领导者时也不考虑延迟,短暂的网络故障会触发计算开销巨大的恢复算法。这个选项本来可以工作,但需要花费过多的工程努力来解决这些缺陷。*
+
+如上述内容所述,Group Replication 的主要问题是 Paxos 消息缺乏持久性。最初的设计背景包括:
+
+1. 次优的 SSD 硬件性能。
+
+2. Paxos 日志持久化不满足具有多个主节点的 Group Replication 的要求。
+
+   如果认证数据库中没有持久化存储,具有多个主节点的 Group Replication 无法使用 Paxos 消息持久化进行崩溃恢复。MySQL 重启后,没有对应的认证数据库,这使得继续处理持久化的 Paxos 消息容易导致状态不一致。
+
+基于使用 NVMe SSD 的 Group Replication 单主模式,使用 SysBench 纯写测试来检查添加 Paxos 持久化对吞吐量的影响。请参考下图:
+
+<img src="../media/image-20240829105418671.png" alt="image-20240829105418671" style="zoom:150%;" />
+
+图 9-1. SysBench 纯写测试中 Paxos 日志持久化的性能开销。
+
+从图中可以看出,在添加 Paxos 持久化后,在低并发下性能略有下降,这是预期的结果。然而,在高并发下,差异并不显著。这是因为在高并发下,Paxos 使用批处理机制,允许多个事务记录一起记录到 Paxos 实例中,从而减少 I/O 压力。
+
+接下来,让我们检查比较响应时间。
+
+<img src="../media/image-20240829105441723.png" alt="image-20240829105441723" style="zoom:150%;" />
+
+图 9-2. 添加 Paxos 日志持久化后,SysBench 纯写测试中的平均响应时间增加。
+
+该图显示了 50 到 200 个并发场景的响应时间。使用 Paxos 日志持久化后平均响应时间的增加是可以接受的。SysBench 纯写测试对 Group Replication 施加了很大压力,而 TPC-C 测试由于其读操作,减少了对 Group Replication 的写压力。关于基于单主模式的 Group Replication、使用 SSD 以及 BenchmarkSQL 在各种并发级别下的 TPC-C 吞吐量比较,请参考下图。
+
+<img src="../media/image-20240829105506722.png" alt="image-20240829105506722" style="zoom:150%;" />
+
+图 9-3. BenchmarkSQL 测试中 Paxos 日志持久化的性能开销。
+
+该图显示,在低并发级别下,具有 Paxos 日志持久化的版本吞吐量略低,尽管影响远小于 SysBench 纯写测试。根据各种测试的结果,可以得出结论,在当前 SSD 硬件条件下,采用 Paxos 日志持久化是一个可行的解决方案。
+
+### 9.1.2 将木桶原理应用于认证数据库
+
+使用认证数据库的冲突检测是乐观并发控制(Optimistic Concurrency Control, OCC)的一部分。OCC 允许多个事务并发地读取和更新数据而不会阻塞,通过维护事务历史并在提交前检查冲突。如果检测到冲突,其中一个事务会被回滚。虽然 OCC 避免了锁等待,但在实际冲突期间可能会产生巨大的损失,类似于两阶段锁(2PL),但使用回滚而不是锁等待。OCC 在冲突不频繁时表现良好,但当冲突频繁时会遭受过多的回滚和重试,在这种场景下效果不佳[59]。
+
+在多主 Group Replication 中,每个 MySQL 节点可以独立写入,因此需要全局并发控制。MySQL 为此使用认证数据库,实现 OCC 来决定事务提交或回滚。然而,在写冲突严重的情况下,OCC 可能会导致大量回滚,表明其在高冲突场景下效果不佳。
+
+让我们继续检查 MySQL 认证数据库使用的数据结构:
+
+```c++
+typedef std::unordered_map<
+      std::string, Gtid_set_ref *, std::hash<std::string>,
+      std::equal_to<std::string>,
+      Malloc_allocator<std::pair<const std::string, Gtid_set_ref *>>>
+      Certification_info;
+  ...
+  /**
+    Certification database.
+  */
+  Certification_info certification_info;
+```
+
+认证数据库使用 C++ 标准模板库(STD)中的 *unordered_map*,这是一个哈希表。该数据库存储有关事务写操作的信息,其中每个键是表示一行的 base64 编码字符串,每个值包含用于回放计算的 GTID 和相关信息。以下代码演示了如何向认证数据库插入一行。
+
+```c++
+bool Certifier::add_item(const char *item, Gtid_set_ref *snapshot_version,
+                         int64 *item_previous_sequence_number) {
+  DBUG_TRACE;
+  mysql_mutex_assert_owner(&LOCK_certification_info);
+  bool error = true;
+  std::string key(item);
+  Certification_info::iterator it = certification_info.find(key);
+  snapshot_version->link();
+  if (it == certification_info.end()) {
+    std::pair<Certification_info::iterator, bool> ret =
+        certification_info.insert(
+            std::pair<std::string, Gtid_set_ref *>(key, snapshot_version));
+    error = !ret.second;
+  } else {
+    *item_previous_sequence_number =
+        it->second->get_parallel_applier_sequence_number();
+    if (it->second->unlink() == 0) delete it->second;
+    it->second = snapshot_version;
+    error = false;
+  }
+  ...
+  return error;
+}
+```
+
+随着更新变得更加频繁,认证数据库会变得更大。为了及时清理过时的信息,Group Replication 使用木桶原理。例如,如果最慢节点执行的 GTID 是 A,那么认证数据库中 GTID 小于或等于 A 的信息可以被清理。
+
+接下来,查看在 Group Replication 运行期间拍摄的 *perf* 截图如下。
+
+![](../media/5bab13cb8c49573cfda4fcad2222fe57.png)
+
+图 9-4. 哈希表操作中揭示的瓶颈。
+
+该图揭示了操作哈希表的瓶颈。清理认证数据库类似于垃圾回收;在清理发生时,事务必须等待,这涉及大量的内存释放。排队理论表明,这种延迟会显著影响事务处理速度。下图显示了 Group Replication 和半同步复制的吞吐量与并发性之间的关系。
+
+<img src="../media/image-20240829105659262.png" alt="image-20240829105659262" style="zoom:150%;" />
+
+图 9-5. 半同步复制和 Group Replication 之间的性能比较。
+
+该图显示 Group Replication 的峰值吞吐量低于半同步复制。
+
+用户需要什么样的 Group Replication?鉴于 Group Replication 是为高可用性服务设计的,其高可用性功能不应显著影响性能。用户期望 Group Replication 提供真正的高可用性,同时也提供比半同步复制更好的性能。
+
+### 9.1.3 缺乏严格遵守状态机复制机制
+
+实现具有强一致性的容错分布式系统的一种众所周知的方法是状态机复制。该技术将操作排序并传播到所有服务器,然后按顺序执行它们。状态机的所有副本从相同的初始状态开始,经过相同的状态序列,并产生相同的输出序列。状态机复制确保副本之间的强一致性,使分布式服务表现为一个连贯的集中式服务,同时保留分布式优势。
+
+状态机复制的关键是所有副本从相同的初始状态开始,经过相同的状态,并产生相同的输出[41]。任何偏离这一规则的行为都不符合要求且难以检测,通常只在边缘情况下才会暴露问题。所有节点必须按相同的顺序执行,具有相同的事务和底层数据。
+
+在 Group Replication 多主架构中,发生了规则违反:*CT_CERTIFICATION_MESSAGE* 消息没有被放入 applier 队列,导致处理顺序不统一。以下是提前处理 *CT_CERTIFICATION_MESSAGE* 消息的函数 *handle_certifier_data*。
+
+```c++
+void Plugin_gcs_events_handler::handle_certifier_message(
+    const Gcs_message &message) const {
+  if (this->applier_module == nullptr) {
+    LogPluginErr(ERROR_LEVEL,
+                 ER_GRP_RPL_MISSING_GRP_RPL_APPLIER); /* purecov: inspected */
+    return;                                           /* purecov: inspected */
+  }
+  Certifier_interface *certifier =
+      this->applier_module->get_certification_handler()->get_certifier();
+  const unsigned char *payload_data = nullptr;
+  size_t payload_size = 0;
+  Plugin_gcs_message::get_first_payload_item_raw_data(
+      message.get_message_data().get_payload(), &payload_data, &payload_size);
+  if (certifier->handle_certifier_data(payload_data,
+                                       static_cast<ulong>(payload_size),
+                                       message.get_origin())) {
+    LogPluginErr(
+        ERROR_LEVEL,
+        ER_GRP_RPL_CERTIFIER_MSSG_PROCESS_ERROR); /* purecov: inspected */
+  }
+}
+```
+
+过早处理 *CT_CERTIFICATION_MESSAGE* 消息可能导致不同节点的 OCC 所依赖的认证数据库数据不一致,从而可能导致最终数据不一致。虽然这个问题可能不容易检测,但在特定条件下重现相对简单。
+
+具体重现细节如下:在 Group Replication 多主场景中,使用负载均衡器(如 LVS)将写压力均匀分布在所有 MySQL 节点上。如果写冲突足够多,就有可能重现状态机复制最终状态的不一致。
+
+基于大量测试,将认证消息放入 applier 队列进行统一处理可以消除上述数据不一致问题。
+
+### 9.1.4 Group Replication 缺乏内置高可用性
+
+Group Replication 在以下情况下可能面临集体故障场景:
+
+1. 如果 MySQL 从节点的 I/O 空间已满,导致回放阻塞,可能会在整个集群中触发级联效应。
+2. 如果 MySQL 从节点上的回放因任何原因停止,有效地将其吞吐量降至零,根据木桶原理,集群的整体吞吐量最终会降至零。
+
+Group Replication 是为高可用性设计的,但这些问题可能使整个集群系统不可用。因此,解决 Group Replication 固有的高可用性问题对于为用户提供更好的高可用性至关重要。
+
+## 9.2 Paxos 变体算法的问题
+
+### 9.2.1 为什么没有采用 Raft 协议?
+
+Raft 是一种在容错性和性能上等同于 Multi-Paxos 的共识算法。Raft 旨在提高可理解性,并详细描述以满足实际系统需求。与 Paxos 不同,Raft 减少了状态空间并将共识分为领导者选举、日志复制和安全阶段。它通过选举的领导者实现共识,并且不具有拜占庭容错性。只有具有最新数据的服务器才能成为领导者,它包括使用重叠多数来更改集群成员身份的机制以确保安全[42]。
+
+在设计 Group Replication 时,目标是同时支持单主和多主模式。采用 Raft 或 Multi-Paxos 协议无法有效支持 Group Replication 的多主模式。因此,选择了具有多个领导者的 Paxos 变体,即 Mencius 算法。
+
+### 9.2.2 在 Group Replication 中实现 Mencius 的问题
+
+Group Replication 在其核心采用了 Mencius,这是一种源自 Paxos 的多领导者状态机复制协议。Mencius 的新颖之处在于它不仅分区序列号,还解决了关键性能问题,如适应不断变化的客户端负载和非对称网络带宽。
+
+Mencius 通过使用称为简单共识的简化共识版本来实现这一点。这允许客户端负载较低的服务器跳过它们的轮次,而无需多数同意。通过机会性地在其他消息上捎带 SKIP 消息,Mencius 使服务器能够以最少的通信和计算开销跳过轮次,使其能够有效地适应客户端和网络负载的变化[32]。
+
+不幸的是,Group Replication 没有遵守上述设计。等待 SKIP 信息的成本仍然很大,导致 Group Replication 经历潜在的吞吐量波动和比预期更长的响应时间,特别是在跨数据中心部署场景中。
+
+### 9.2.3 为什么添加自己的 Multi-Paxos 实现?
+
+鉴于 MySQL 在现有 Mencius 算法之外引入了新的 Multi-Paxos 算法,这表明 Mencius 实现存在不足或 Mencius 算法本身存在固有问题。
+
+关于 Mencius 算法,以下方面特别值得注意[32]:
+
+*通过机会性地在其他消息上捎带 SKIP 消息,Mencius 允许服务器以很少或不需要通信和计算开销跳过轮次。这使得 Mencius 能够廉价地适应客户端和网络负载的变化。*
+
+可以推断,即使在严重的领导者不平衡下,Mencius 算法也表现良好,因为理论验证和实际证据都支持这一点。因此,问题很可能是由于 Mencius 算法的实现不充分。
+
+当 Mencius 算法没有理论问题时,引入新的 Multi-Paxos 算法并不是一个优雅的解决方案,并带来了几个挑战:
+
+1. **高维护成本**:维护和测试两套代码库使这部分的工作量加倍。
+2. **回归测试挑战**:在实践中,新算法导致了几个回归问题,其中一些难以解决。
+3. **部分解决问题**:新算法可能只部分解决需求。在 Group Replication 的单主模式下,它可能不是普遍适用的,因为一致的读写操作需要所有节点持续通信信息。
+
+## 9.3 Paxos Skip 优化的具体实现
+
+首先,让我们调查 MySQL Mencius 算法实现的性能问题。下图显示了当 Mencius 算法在网络延迟为 10ms 时稳定运行的网络交互状态:
+
+![](../media/77d0c0bdc5ce8574c6ad319864abb032.gif)
+
+图 9-6. 从数据包捕获数据中洞察 Mencius 协议。
+
+图中的绿色框表明两个连续 Paxos 实例之间的时间间隔达到了 24ms。这表明 MySQL 中的 Mencius 算法在其实现中未与单个往返时间(Round-trip Time, RTT)对齐。
+
+接下来,让我们参考 Mencius 算法论文*"State Machine Replication for Wide Area Networks"*[54]。网络测试环境的具体细节如下:
+
+![](../media/185beb2c6e0524d93abde3b25ecedc61.png)
+
+从绿色框中可以清楚地看到,论文中测试的网络延迟是 RTT=100ms。现在让我们检查论文中提供的关于 Paxos 处理的相关信息。
+
+![](../media/f67a3249ad8b040417f195c3ca11f795.png)
+
+图 9-7. Mencius 论文中指示的 Mencius 协议的共识机制。
+
+根据该图,可以推断如果只有一个节点生成请求,Mencius 协议共识需要 100ms,相当于一个往返时间(RTT)。这表明从 Group Replication 主节点的角度来看,可以在单个 RTT 内实现 Mencius 共识。理论可行性明确后,以下讨论将重点关注优化 Group Replication 的 Mencius 通信。
+
+优化 Mencius 的理论基础包括[32]:
+
+*跳过是使 Mencius 高效的核心技术。*
+
+[Paxos skip 优化后的具体 Paxos 网络交互]([Paxos Visualization](https://enhancedformysql.github.io/animation/paxos_app.html))图如下图所示:
+
+![](../media/55787cfe149ebf1c574aa1da4eea678c.png)
+
+图 9-8. Paxos skip 优化机制。
+
+当 Paxos 节点从 Paxos 领导者接收到 *accept_op* 消息并且自己没有要提议的消息时,它可以在发送 *ack_accept_op* 消息时包含 skip 信息。这通知其他节点当前节点在这一轮不会提议任何消息。在正常稳定运行期间,Paxos 节点可以以这种方式处理每个 *accept_op* 消息。
+
+在具体实现中,还必须考虑流水线的影响。在 Paxos skip 优化过程中,有必要记录这些 skip 操作,以避免不同 Paxos 实例通信之间的干扰。
+
+最后,在 10ms 网络延迟场景下,评估 Paxos skip 优化的有效性显示出显著的好处。以下是 Paxos skip 优化前后不同并发级别下 TPC-C 吞吐量的比较:
+
+<img src="../media/image-20240829110009589.png" alt="image-20240829110009589" style="zoom:150%;" />
+
+图 9-9. Paxos skip 优化对具有 10ms 延迟的 BenchmarkSQL 测试的影响。
+
+从图中可以清楚地看到,Paxos skip 优化在 10ms 网络延迟下显著提高了性能。大量的 TPC-C 测试证实,无论使用单主还是多主,这种优化都能提高 Group Replication 的性能,并支持一致的读写。
+
+与具有单个领导者的 Multi-Paxos 实现相比,Paxos skip 优化将代码复杂性降低了一个数量级。它还最大限度地减少了回归测试问题并简化了维护。
+
+总的来说,利用理论和逻辑解决方案优雅地解决这个问题比当前原生 MySQL 实现更有效。
+
+## 9.4 使用 Group Replication 单主模式的优化设计
+
+基于 Paxos 日志持久化的可行性,Group Replication 单主模式的设计架构可以构建如下:
+
+![](../media/09cc60d64a306229adf9c4848d348c48.png)
+
+图 9-10. 重新设计的具有 Paxos 日志持久化的 Group Replication 单主模式。
+
+当事务提交时,它经过 Paxos 通信,只有在持久化到 Paxos 日志后才能达成共识。一旦达成共识,主服务器继续执行操作,如将事务写入二进制日志并执行提交。同时,从服务器处理诸如计算回放的 last_committed 值、将事务事件写入中继日志和回放事务等任务。
+
+从服务器需要在 Group Replication 中计算 last_committed 值,因为主服务器在进行底层 Paxos 通信之前尚未达到 binlog 阶段。因此,last_committed 值尚不可用。从服务器从认证数据库中的 writeset 信息计算 last_committed 值,允许 Group Replication 实现高度并行回放。
+
+在 MySQL 从节点计算 last_committed 后,下一步是将事务事件写入中继日志。为了加快写入磁盘的速度,应该使用批处理技术,其实现需要仔细规划。
+
+提高回放速度对以下方面至关重要:
+
+- **快速故障切换**:更快的回放确保更快的故障切换。
+- **提高数据新鲜度**:更快的回放增加了访问最新数据的机会。
+
+在解决了这些方面之后,Group Replication 单主模式的设计就完成了,为高性能、高可用性系统奠定了基础,该系统具有快速故障切换和高效的状态机复制。
+
+### 9.4.1 Paxos 日志持久化
+
+Paxos 日志持久化可行性的最关键基础[30]:
+
+*为了在并发系统中获得额外的吞吐量,可以将不同应用程序线程提交的值集合批处理到单个 Paxos 实例中。*
+
+通过使用批处理技术,可以将多个事务分组到单个 Paxos 实例中。达成共识后,可以一起将事务数据写入磁盘,从而显著减少 I/O 压力。随着 SSD 技术的进步,在不丢失数据的情况下实现状态机复制完全可行。
+
+### 9.4.2 绕过冲突检测
+
+传统的认证数据库使用大量内存,特别是当主节点和从节点之间存在速度不匹配时,由于大量的内存分配和释放,导致队列等待时间增加。在 NUMA 环境中,频繁的跨 NUMA 内存分配会使性能恶化。
+
+在 Group Replication 单主模式下,绕过认证数据库中的冲突检测是可行的。冲突检测主要用于:
+
+1. Group Replication 多主模式。
+2. 在 Group Replication 单主切换期间,当新主节点仍在回放事务时接收新的用户请求。
+
+对于单主模式的 Group Replication,只需要考虑第二种场景,而像 'before on primary failover' 这样的机制确保新主节点在接受新请求之前完成事务回放。加速 MySQL 从节点上的回放过程可以帮助减少用户等待时间。
+
+### 9.4.3 快速计算回放所需的 last_committed 值
+
+首先,让我们澄清术语"*sequence_number*"和"*last_committed*":
+
+- **sequence_number**:这是一个自动递增的值,用于在 Group Replication 操作期间跟踪事务的顺序。每个事务在操作期间都被分配一个唯一的 *sequence_number*。
+- **last_committed**:此值指示新事务所依赖的最后提交事务的序列号。为了在 MySQL 从节点上回放期间继续执行事务,事务必须等到 *sequence_number* 等于 *last_committed* 的事务已完全回放。
+
+例如,在下面绿色框中突出显示的事务中,*sequence_number=12759* 和 *last_committed=12757*,*last_committed=12757* 表示 *sequence_number=12759* 的事务必须等到 *sequence_number=12757* 的事务已完全回放后才能继续。
+
+![](../media/9aa41ee1e12bb8a72dd240dc42b44ba5.gif)
+
+图 9-11. *sequence_number* 和 *last_committed* 的典型示例。
+
+一旦理解了 *sequence_number* 和 *last_committed*,就可以探索 *last_committed* 值的计算。通常,此值源自事务的 writeset,它详细说明了事务修改的行。writeset 中的每一行都由对应于表行的键表示。在 writeset 中:
+
+- 对于更新操作,有两个具有相同键的元素。
+- 对于插入和删除操作,有一个元素。
+- DDL 事务的 writeset 为空,表示 DDL 操作必须串行回放。
+
+在 Group Replication 中,当处理事务的 writeset 时,applier 线程检查认证数据库中是否有修改了 writeset 中相同记录的事务。如果找到此类事务,applier 线程确定小于当前事务 *sequence_number* 的最新 *sequence_number*,这成为事务的 *last_committed* 值。这确保事务以正确的顺序回放以保持数据一致性。
+
+在深入分析之前,让我们回顾一下 applier 线程的作用:
+
+1. 根据认证数据库计算 *last_committed*。
+2. 将事务事件写入中继日志文件。
+
+以下是从捕获 applier 线程的性能数据生成的火焰图:
+
+![](../media/6a6091b51c602923e5fe8b33e4422882.png)
+
+图 9-12. applier 线程性能数据的火焰图。
+
+从火焰图中可以看出,认证数据库中的 *'add_item'* 操作消耗了 29.80% 的计算时间,其中一半时间花在哈希表操作上。哈希表的低效导致计算 last_committed 的 CPU 资源消耗较高,并且延迟了将事务事件写入磁盘。
+
+为了解决这个瓶颈并提高磁盘写入性能,必须减少哈希表的开销。由于直接改进哈希表具有挑战性,因此需要一个新的数据结构。
+
+基于 Group Replication 单主模式的设计,开发了一个重新设计的数据结构来替换认证数据库中以前的哈希表方法。这个新结构旨在消除计算 last_committed 的延迟,并确保及时将事务事件写入磁盘。请参阅下面新数据结构的具体代码:
+
+```c++
+#define REPLAY_CAL_HASH_ITEMS (REPLAY_CAL_HASH_ITEM / 8)
+#define MAX_RELATIVE_SEQUENCE_NUMBER 65535
+#define REPLAY_CAL_ARRAY 65536
+#define REPLAY_CAL_HASH_ITEM 4088
+typedef struct {
+  int number;
+  int size;
+  unsigned char values[REPLAY_CAL_HASH_ITEM];
+} replay_cal_hash_item;
+
+class Certifier : public Certifier_interface {
+ ...
+ private:
+  replay_cal_hash_item replayed_cal_array[REPLAY_CAL_ARRAY];
+ ...
+```
+
+为了存储计算 *last_committed* 所需的信息,使用了一个名为 *replayed_cal_array* 的静态数组。该数组包含 65,536 个元素,每个元素代表一个桶槽,具有一个 *replay_cal_hash_item*。*replay_cal_hash_item* 结构包括:
+
+- **number**:表示 *replay_cal_hash_item* 中元素的当前计数,跟踪有多少元素正在使用中。
+- **size**:指定 *replay_cal_hash_item* 的最大容量,定义它可以容纳的元素的上限。
+- **values**:一个包含 4,088 个无符号字符元素的数组,用于存储数据。
+
+**values** 成员用于存储 511 个条目,每个条目占用 8 个字节。每个条目包括:
+
+- **键值(Key Value)**:6 字节。
+- **相对序列号(Relative Sequence Number)**:2 字节。
+
+有关具体细节,请参考下图:
+
+![](../media/68eb47a320bce3bb717a2b690da4573d.png)
+
+图 9-13. 适合计算 last_committed 的新数据结构。
+
+*key* 经过 base64 转换为 8 字节整数。这个 8 字节整数分为如下:
+
+- **replayed_cal_array 的索引**:前两个字节用作 *replayed_cal_array* 的索引。
+- **值**:剩余的六个字节存储在每个 8 字节条目的前六个字节中。
+
+关于 *sequence_number* 的存储:
+
+- 仅存储 *sequence_number* 的相对值,计算为当前 *sequence_number* 减去基序列值。
+- 这个相对 *sequence_number* 不需要 8 个字节,只需要 2 个字节。
+- 这个 2 字节的相对 *sequence_number* 存储在每个 8 字节条目的最后两个字节中。
+
+这种设置通过使用 *key* 的紧凑表示和仅存储必要的相对 *sequence_number* 来优化存储,确保 *replay_cal_hash_item* 结构内的高效内存使用。
+
+基于新数据结构的算法如下图所示,突出了以下要点:
+
+1. 充分利用 *keys* 的特性和 *sequence* 数字的单调增加,有效压缩存储空间,使新数据结构的内存使用效率非常高。
+2. 对存储的信息设置上限。一旦超过阈值,就会触发类似于检查点的过程,并将当前事务设置为串行回放。
+3. 新数据结构的内容相对较小,缓存命中率高。此外,在 *replay_cal_hash_item* 中,*values* 是连续存储的,使其非常缓存友好。
+
+![](../media/b5a20f07b4812ea9f34ffb8e8783b73a.png)
+
+图 9-14. 适合计算 last_committed 的新算法。
+
+应该注意的是,新数据结构占用的内存占用空间为 256MB(65536 \* 4096 字节),与基准测试期间传统认证数据库通常需要的几千兆字节甚至几十千兆字节相比,这要小得多。这种适度的内存使用为优化整个 applier 线程的性能奠定了坚实的基础。
+
+优化后,applier 线程显著加快了 last_committed 值的计算,导致 applier 线程的整体处理速度有了相当大的改进。以下是使用改进版本捕获 applier 线程的 *perf* 数据生成的火焰图。
+
+![](../media/290e969038561faf1ace6e108945b2d6.png)
+
+图 9-15. 优化后 applier 线程性能数据的火焰图。
+
+从图中可以观察到,*Certifier::certify* 的 CPU 处理开销显著降低。具体来说,*quick_add_item* 现在仅占 12.85% 的开销,而以前,当吞吐量较低时,*add_item* 消耗了 29.80%。这突出了采用新数据结构实现的显著性能改进。
+
+根据大量的 TPC-C 测试统计,可以得出以下优化结论:优化前,applier 线程的磁盘吞吐量支持约 500,000 tpmC。优化后,由于有更多的 CPU 时间可用于处理磁盘写入,applier 线程的磁盘吞吐量现在支持约 1,000,000 tpmC。
+
+这种改进不仅增强了 applier 线程的整体处理能力,还加速了过时 writeset 信息的清理。根据测试,每次清理操作现在只需几毫秒。因此,它有效地缓解了原生 Group Replication 固有的性能波动,进一步提高了稳定性。
+
+从这个案例研究中,可以总结出性能改进的原因如下:
+
+1. **values 的静态数组**:在 *replay_cal_hash_item* 中使用静态数组作为 *values* 提高了搜索效率,因为连续的内存访问使其非常缓存友好。
+2. **减少数据存储**:存储的数据量已显著减少。以前,可能需要千兆字节的存储,而现在只需要 256MB。较小的内存占用通常会导致更高的效率。
+3. **固定内存空间**:分配的内存空间是固定的,不需要动态分配。以前频繁的内存分配和释放由于内存操作的同步性质而不利于高性能。
+4. **高效的认证清理**:认证清理可以实现毫秒级性能。在认证清理期间,只需要对 65,536 个 *replay_cal_hash_item* 项中的 *number* 值进行清零操作。
+
+通过基于 Group Replication 的单主模式实现更好的数据结构来实现相同的 last_committed 计算功能,可以显著增强 applier 线程的最大处理能力,并消除性能波动。
+
+### 9.4.4 中继日志的批量写入机制
+
+事务事件日志记录到磁盘是 applier 线程的两个主要任务之一。这种日志记录的效率直接影响 Group Replication 的可用性。如果日志记录过程效率低下,根据排队理论,applier 队列大小将持续增加。让我们检查 applier 线程的优化主过程,如下图所示:
+
+![](../media/331f4d2fe9b0d5939e8882a770592c94.png)
+
+图 9-16. applier 线程的优化主过程。
+
+批量写入机制是指对原生 MySQL 版本的改进,该版本中事件是单独刷新到磁盘的。现在,至少来自同一事务的事件一起刷新,显著减少了 I/O 刷新操作的数量。如果应用队列大小超过指定阈值,则来自一批事务的事件一起刷新,进一步减少了 I/O 刷新调用的频率。
+
+批量写入机制经过 TPC-C 基准测试,最初将磁盘写入速度从刚刚超过 200,000 tpmC 提高到 500,000 tpmC。随着上一节中对 last_committed 回放计算的进一步增强,这个速度可以推到大约 1,000,000 tpmC,有效解决了由于磁盘写入延迟导致的 applier 队列过度增长的相关问题。
+
+### 9.4.5 与传统 Group Replication 的性能比较
+
+下图比较了不同模式下 TPC-C 吞吐量与并发级别。部署设置如下:MySQL 主节点和从节点都部署在同一台机器上,使用 NUMA 绑定隔离以防止计算干扰。主节点和从节点使用单独的 NVMe SSD,以确保没有 I/O 操作干扰。
+
+<img src="../media/image-20240829110334937.png" alt="image-20240829110334937" style="zoom:150%;" />
+
+图 9-17. 新 Group Replication 单主模式设计的效果。
+
+从图中可以清楚地看到,新的 Group Replication 单主模式设计全面优于传统的 Group Replication 模式。
+
+## 9.5 如何缓解 Group Replication 中的性能波动?
+
+### 9.5.1 增强故障检测机制
+
+由于 FLP 不可能性结果,准确检测节点故障具有挑战性,该结果指出,如果即使一个进程可以失败,在纯异步系统中共识是不可能的。困难在于,当服务器没有收到来自另一个服务器的消息时,无法区分该服务器是否已失败或只是"非常慢"[32]。幸运的是,大多数实际系统不是纯异步的,因此 FLP 结果不适用。为了规避这一点,对系统同步性做出了额外的假设,允许设计在某些条件下保持安全性并提供活性的协议。一种常见的方法是使用不准确的本地故障检测器。
+
+![](../media/e2554f0ea244f337c0e66ea34bf53edf.gif)
+
+图 9-18. 从 Mencius 论文中借用的异步消息传递模型。
+
+上图说明了异步消息传递模型。每个故障检测器监视服务器并维护怀疑有故障的服务器列表。这些检测器可能会犯错误,例如怀疑正在运行的服务器已崩溃。如果稍后更正,可以将服务器从怀疑列表中删除。使用故障检测器的协议必须始终确保安全性,尽管存在这些错误,并在检测器长时间保持准确时保证进展。
+
+Group Replication 的故障检测机制识别并驱逐不通信的成员。这增加了组包含大多数正常成员的可能性,确保正确的客户端请求处理。所有组成员定期交换消息。如果一个成员在 5 秒内没有从另一个成员那里收到消息,它就会怀疑该成员。如果怀疑没有得到解决,该成员将被驱逐。被驱逐的成员不知道其状态,并认为其他成员无法访问。如果它重新连接,它会通过更新的成员身份视图了解其被驱逐。
+
+在理解了上述内容后,让我们分析常见类型的视图更改事件:
+
+1. **节点被杀死**
+
+   在 Linux 系统中,当节点被杀死时,TCP 层通常会发送重置(RST)数据包以通知其他节点连接问题。Paxos 通信可以使用此 RST 数据包来识别节点的终止。然而,MySQL 没有专门处理这一点,而是依赖标准超时机制。
+
+2. **节点被网络分区**
+
+   检测节点是被网络分区还是只是慢是具有挑战性的。在这种情况下,使用超时机制,因为很难明确区分这些情况。
+
+3. **节点优雅下线**
+
+   通常,通过发送命令通知其他节点应该很简单。然而,MySQL 没有很好地管理这一方面。
+
+4. **向集群添加新节点**
+
+   添加新节点需要共识,并涉及最终的安装视图同步。虽然预计会有一些性能波动,但严重的波动表明节点添加过程处理不佳。
+
+每当发生需要复制的更改时,组必须达成共识。这适用于常规事务、组成员身份更改以及某些用于维护组一致性的内部消息传递。共识需要组成员的多数同意决定。没有多数,组就无法进展并阻塞,因为它无法获得法定人数。
+
+由于多个非自愿故障,可能会失去法定人数,导致大多数服务器被突然删除。在一个 5 台服务器的组中,如果 3 台服务器同时变得无响应,则失去多数,这会阻止达到法定人数。
+
+相反,如果服务器自愿退出组,它们可以指示组重新配置自己。离开组的服务器会通知其他服务器,允许正确的重新配置。这保持了成员身份的一致性并重新计算多数。例如,如果 5 台服务器中的 3 台一个接一个地离开,通知组,成员身份可以从 5 调整到 2,同时在过程中获得法定人数[13]。
+
+在理解了视图更改的工作机制后,就可以检查 MySQL 如何处理它。
+
+在节点故障或网络分区的情况下,MySQL 的处理方法类似。进行了一项测试,杀死了一个 MySQL 从节点。测试的细节可以在下图中看到。
+
+<img src="../media/image-20240829110513812.png" alt="image-20240829110513812" style="zoom:150%;" />
+
+图 9-19. 当节点被杀死时吞吐量显著波动。
+
+从图中可以清楚地看到,当 MySQL 从节点被杀死时,MySQL 主节点的吞吐量显著波动,下降到零的时间持续超过 20 秒。理想情况下,在三节点集群中,如果一个节点被杀死,剩余的两个节点应该仍然形成多数,防止长时间的零吞吐量问题。这表明 MySQL 可能无法有效管理多数法定人数和故障检测机制。
+
+当 MySQL 从节点优雅下线时,吞吐量通常表现如下:
+
+<img src="../media/image-20240829110533157.png" alt="image-20240829110533157" style="zoom:150%;" />
+
+图 9-20. 当节点关闭时,吞吐量间隔下降到零。
+
+该图显示,允许 MySQL 节点优雅下线会导致吞吐量在几个点下降到零,表明故障检测机制存在问题。
+
+在 Group Replication 中添加 MySQL 节点时会发生什么?
+
+<img src="../media/image-20240829110551420.png" alt="image-20240829110551420" style="zoom:150%;" />
+
+图 9-21. 添加节点时吞吐量下降约 10 秒。
+
+从图中可以清楚地看到,节点添加过程导致吞吐量下降约 10 秒。这表明 MySQL 没有有效地处理节点添加过程。
+
+为了解决 Group Replication 中的这些问题,改进探测机制对于增强故障检测准确性至关重要。如果没有这种改进,吞吐量可能会受到严重干扰,使进一步的性能增强变得具有挑战性。
+
+关于探测机制,已进行了以下改进。
+
+1. **确保探测协程的公平执行**
+
+   在处理大型事务期间,Paxos 协议处理大量的 writeset 数据,垄断了单线程协程模型的处理资源。这为探测检测协程更新关键信息留下了有限的机会。因此,过时的探测数据可能导致错误的判断,如 1.2.5 节所述。
+
+   为了解决这个问题,解决方案是通过将大型事务拆分为多个阶段来分摊数据处理。这种方法确保探测检测协程获得更公平的执行机会并及时更新信息,从而提高故障检测的准确性。
+
+2. **改进唤醒延迟函数**
+
+   检查 MySQL 中的 **wakeup_delay** 函数,如下面的代码所示:
+
+   ```c++
+   static double wakeup_delay(double old) {
+     double const minimum_threshold = 0.1;
+   #ifdef EXECUTOR_TASK_AGGRESSIVE_NO_OP
+     double const maximum_threshold = 1.0;
+   #else
+     double const maximum_threshold = 20.0;
+   #endif /* EXECUTOR_TASK_AGGRESSIVE_NO_OP */
+     double retval = 0.0;
+     if (0.0 == old) {
+       double m = median_time();
+       double const fuzz = 5.0;
+       IFDBG(D_BUG, FN; NDBG(m, f));
+       // Guard against unreasonable estimates of median consensus time
+       if (m <= 0.0) m = minimum_threshold;
+       if (m > maximum_threshold / fuzz) m = (maximum_threshold / fuzz) / 2.0;
+       retval = minimum_threshold + fuzz * m + m * xcom_drand48();
+     } else {
+       retval = old * 1.4142136; /* Exponential backoff */
+     }
+     /* If we exceed maximum, choose a random value in the max/2..max interval */
+     if (retval > maximum_threshold) {
+       double const low = maximum_threshold / 2.0;
+       retval = low + xcom_drand48() * (maximum_threshold - low);
+     }
+     IFDBG(D_BUG, FN; NDBG(retval, f));
+     return retval;
+   }
+   ```
+
+   从代码中可以清楚地看到,计算的延迟时间过于死板。这种不灵活性是性能波动的关键原因,因为主节点在节点退出后可能等待时间过长。为了解决这个问题,根据环境调整相关常数对于适应复杂多变的网络条件至关重要。
+
+3. **拆分 wakeup_delay 函数以适应不同环境**
+
+   例如,在检查 propose 消息是否已被接受时,使用原始的 *wakeup_delay* 函数,如下面的代码所示:
+
+   ```c++
+         while (!finished(ep->p)) { /* Try to get a value accepted */
+           /* We will wake up periodically, and whenever a message arrives */
+           TIMED_TASK_WAIT(&ep->p->rv, ep->delay = wakeup_delay(ep->delay));
+           ...
+   ```
+
+   在函数 *get_xcom_message* 中,使用 *wakeup_delay_for_perf* 函数,如下面的代码所示:
+
+   ```c++
+     DECL_ENV
+     ...
+     while (!finished(*p)) {
+       ...
+       if (!((*p)->force_delivery)) {
+         ep->delay = wakeup_delay_for_perf(ep->delay, 0.003);
+       } else {
+         ep->delay = wakeup_delay_for_perf(ep->delay, 0.1);
+       }
+       IFDBG(D_NONE, FN; NDBG(ep->delay, f));
+       TIMED_TASK_WAIT(&(*p)->rv, ep->delay);
+       *p = get_cache(msgno);
+       dump_debug_exec_state();
+     }
+     FINALLY
+     IFDBG(D_NONE, FN; SYCEXP(msgno); PTREXP(*p); NDBG(ep->wait, u);
+           SYCEXP(msgno));
+     TASK_END;
+   }
+   ```
+
+   在 *wakeup_delay_for_perf* 函数中,可以采用更激进的策略,例如进一步减少等待时间。
+
+4. 将网络的往返时间(Round-trip time, RTT)纳入 wakeup_delay。
+
+   其目的是提高网络探测活动的准确性。
+
+5. 区分节点被杀死和网络分区。
+
+   在 Linux 系统中,当节点被杀死时,TCP 向集群中的其他节点发送重置数据包,帮助区分节点终止和网络分区故障。将有关异常节点终止的信息集成到 Paxos 的决策逻辑中,可以做出更准确的判断,解决在突然节点终止期间经历的长时间吞吐量下降的问题。
+
+通过实施上述机制,探测准确性已显著提高。结合即将推出的降级机制,这确保了即使在异常条件下也能保持相对稳定的吞吐量。
+
+### 9.5.2 利用降级机制解决长时间等待问题
+
+当节点在短暂延迟后变得无响应时,降级机制采用基于多数的方法来做出决定。虽然这种机制并不新鲜,并且已经是 Mencius 交互的一部分,但 MySQL 没有有效地利用它来处理异常情况。
+
+降级机制的一个缺点是它增加了网络交互,包括准备阶段,导致性能下降。然而,其优势在于与 MySQL 处理故障的方式相比,它显著提高了吞吐量。理论上,只要多数节点之间的网络延迟较低,降级机制就可以非常有效。
+
+下图比较了节点被杀死后改进前后 SysBench 读写测试的吞吐量。
+
+<img src="../media/image-20240829110903709.png" alt="image-20240829110903709" style="zoom:150%;" />
+
+图 9-22. 当节点被杀死时观察到吞吐量的显著改善。
+
+从图中可以清楚地看到,原生 Group Replication 经历了长时间的吞吐量下降,这对用户来说是不可接受的。在改进的 Group Replication 中,由于降级过程,吞吐量从每秒 20,000 次事务下降到 14,000 次。虽然这种下降是显而易见的,但用户认为这是可以接受的,因为它代表了对原生 Group Replication 的重大改进。
+
+让我们继续检查在特定节点正常关闭后改进前后的吞吐量随时间的比较,如下图所示:
+
+<img src="../media/image-20240829110922449.png" alt="image-20240829110922449" style="zoom:150%;" />
+
+图 9-23. 当节点关闭时观察到吞吐量的显著改善。
+
+从图中可以清楚地看到,与原生版本相比,改进的 Group Replication 提供了更稳定的吞吐量。虽然由于内部同步,视图更改期间会出现轻微波动,但改进的 Group Replication 的吞吐量性能被用户认为是可接受的。相比之下,原生 Group Replication 中频繁的吞吐量下降被认为是不可接受的。
+
+再次,比较在向集群添加 MySQL 从节点的场景中改进前后的吞吐量随时间的变化,如下图所示:
+
+<img src="../media/image-20240829110943245.png" alt="image-20240829110943245" style="zoom:150%;" />
+
+图 9-24. 向集群添加节点时观察到吞吐量的显著改善。
+
+从图中可以清楚地看到,原生 Group Replication 经历了约 10 秒的吞吐量下降,而改进的 Group Replication 仅显示吞吐量的轻微下降,对性能的影响最小。
+
+总体而言,原生 Group Replication 在异常场景中的问题可以得到有效解决。
+
+### 9.5.3 缓解 XCom 缓存中的性能波动
+
+Mencius 算法使用追赶机制来处理滞后的副本。如果进程检测到过去的未决实例并且通过心跳确认了领导者的正确性,它应该查询其他进程以了解决定。
+
+XCom 是 Group Replication 的组通信引擎,包含一个用于存储 Paxos 实例消息和元数据的缓存。此缓存有助于恢复通信失败后重新加入的节点错过的消息。如果消息不再在缓存中,节点必须退出集群并进行成本高昂的传统恢复。因此,在考虑内存约束的同时,XCom 缓存应该足够大以优化恢复效率[13]。
+
+MySQL 使用动态内存分配来调整 XCom 缓存大小。虽然这种方法看起来有利,但测试表明 XCom 缓存导致了性能波动。
+
+让我们检查负责 XCom 缓存内存分配的 expand_lru 函数,如下面的代码所详细说明:
+
+```c++
+static void expand_lru() {
+  uint64_t i;
+  for (i = 0; i < BUCKETS; i++) {
+    lru_machine *l = (lru_machine *)xcom_calloc(1, sizeof(lru_machine));
+    link_init(&l->lru_link, TYPE_HASH("lru_machine"));
+    link_into(&l->lru_link, &probation_lru);
+    init_pax_machine(&l->pax, l, null_synode);
+    cache_length++;
+  }
+}
+```
+
+*expand_lru* 函数根据 *BUCKETS* 的数量分配内存。大量的 *BUCKETS* 可能导致显著的开销。接下来,让我们确定 *BUCKETS* 的具体大小。
+
+*BUCKETS* 的定义如下。
+
+```c++
+static size_t length_increment = INCREMENT;
+static size_t size_decrement = INCREMENT / 10;
+#define BUCKETS length_increment
+```
+
+*BUCKETS* 对应于 *length_increment*,它由 *INCREMENT* 定义。让我们继续检查 *INCREMENT* 的定义。
+
+```c++
+#define MIN_LENGTH MIN_CACHE_SIZE /* Also Default value */
+#define INCREMENT MIN_LENGTH      /* Total number of slots to add/remove */
+```
+
+*INCREMENT* 等同于 *MIN_LENGTH*,*MIN_LENGTH* 由 *MIN_CACHE_SIZE* 定义。最后,*MIN_CACHE_SIZE* 的定义位置如下:
+
+```c++
+enum {
+  EVENT_HORIZON_MIN = 10,
+  EVENT_HORIZON_MAX = 200,
+  MAX_BATCH_SIZE = 0x3fffffff, /* Limit batch size to sensible ? amount */
+  MAX_BATCH_APP_DATA = 5000,   /* Limit nr. of batched elements */
+  MAX_DEAD = 10,
+  PROPOSERS = 10,              /* The number of proposers on one node */
+  MIN_CACHE_SIZE = 250000,     /* Minimum cache size */
+  DEFAULT_CACHE_LIMIT = 1000000000UL /* Reasonable initial cache limit */
+};
+```
+
+*MIN_CACHE_SIZE* 设置为 250,000,使 *BUCKETS* 也为 250,000。因此,*expand_lru* 函数执行 250,000 次内存分配调用。鉴于内存分配是阻塞系统调用,如此多的调用可能会引入从几十到几百毫秒的延迟。之前进行了日志分析以评估执行 250,000 次内存分配调用的开销,如下图所示。
+
+![](../media/c3ab348e58c5eb81b71284b3807943e4.png)
+
+图 9-25. 在典型机器上 250,000 次内存分配调用的开销。
+
+250,000 次内存分配调用花费了 112ms。此外,XCom 缓存经历批量内存释放问题,这也可能导致性能延迟。虽然这些延迟的持续时间随机器性能而异,但几十毫秒的延迟是典型的。这种波动可能导致许多用户提交意外阻塞几十毫秒,严重影响用户体验。
+
+为了解决这个问题,提供了各种配置选项——高端、中端和低端。这些选项涉及为固定静态数组选择适当的大小,这消除了与批量内存分配和释放相关的问题。这种新机制的好处包括:
+
+1. 缓存友好,性能高。
+2. 消除 XCom 缓存端的性能波动。
+
+### 9.5.4 多主认证数据库清理的新策略
+
+在 Group Replication 的单主模式下,实施了一种机制,可以在回放期间快速计算 *last_committed* 值,减少由认证数据库清理引起的显著性能波动。然而,在多主 Group Replication 中,通过认证数据库进行冲突检测是不可避免的,限制了管理性能波动的灵活性。为了应对这些挑战,采用了负载分散策略来缓解显著性能变化的影响。
+
+下图显示了 Group Replication 多主场景中 SysBench 读/写测试吞吐量与时间的关系。
+
+<img src="../media/image-20240829111514798.png" alt="image-20240829111514798" style="zoom:150%;" />
+
+图 9-26. Group Replication 中的性能波动。
+
+该图显示每 60 秒出现明显的吞吐量波动,反映了不稳定性。这种不稳定性源于需要定期清理认证数据库,这需要获取全局锁存器。此过程导致 MySQL 主节点暂停,导致突然的性能下降。
+
+认证数据库消耗大量内存,长时间的清理过程会导致停顿。将清理周期从 60 秒减少到 10 秒并不是一刀切的解决方案。在大型事务处理环境中,10 秒周期可能不够,导致清理周期重叠,从而使性能问题恶化。
+
+根据广泛的实践和经验,有效解决问题涉及:
+
+1. **严格遵守状态机复制**:如 9.1.3 节所述,严格遵循状态机复制机制,确保处理事务的一致性。
+2. **减少 GTID 广播间隔**:将 GTID(全局事务标识符)广播的间隔减少到亚秒级。
+3. **增强事务并行回放**:提高 MySQL 从节点上并行事务回放的效率,特别是对于大型事务,减少内存消耗并缓解"木桶原理"的影响,从而获得更好的性能并减少性能波动的影响。
+
+通过实施这些步骤,将清理周期从 60 秒减少到亚秒级间隔变得可行。这种方法使每次清理操作能够管理更小的数据量,从而减少突然的性能下降并稳定吞吐量。下图显示了应用分摊方法后 SysBench 读/写测试吞吐量与时间的关系。
+
+<img src="../media/image-20240829111542163.png" alt="image-20240829111542163" style="zoom:150%;" />
+
+图 9-27. 改进的 Group Replication 中消除了性能波动。
+
+从图中可以清楚地看到,在优化这部分逻辑后,突然的性能下降已被消除。总的来说,这里实施的解决方案体现了分摊原理的应用,有效地分配和减少了清理操作的影响。
+
+### 9.5.5 Group Replication 单主模式中的流量控制规避
+
+在 Group Replication 中,流量控制机制将 MySQL 从节点与主节点的速度同步,防止主节点超过从节点并避免内存溢出(Out-Of-Memory, OOM)等性能问题。
+
+要避免在单主设置中 Group Replication 流量控制的影响,请考虑以下策略:
+
+1. **加速 MySQL 从节点回放速度**:提高 MySQL 从节点上事务的回放速度,特别是对于大型事务。这有助于确保从节点能够跟上主节点,减少流量控制干预的需要。
+2. **增加中继日志写入速度**:加快写入中继日志的过程,以防止 applier 队列由于写入磁盘的延迟而过度增长。这防止了内存使用的激增,这可能会触发流量控制机制。
+
+通过在单主 Group Replication 设置中实施这两种策略,可以有效避免 Group Replication 施加的流量控制机制。
+
+## 9.6 视图更改的复杂性问题
+
+当 Group Replication 集群中节点的成员身份发生更改时,会发生相应的视图更改事件。这些视图更改事件也需要大多数 Paxos 参与者之间达成共识。
+
+### 9.6.1 理论基础
+
+为了实现高可用性,传入的负载应该以相同的顺序复制到多个节点。这种分布减轻了主从节点的负担,允许另一个从节点在主节点失败时快速接管,同时即使在恢复后也保留原始日志顺序[43]。
+
+为不同成员的每次统治分配一个唯一的视图号,建立总排序。系统通过一系列视图进展,每当成员更改时就会发生视图更改。来自不同视图的多个提议按其视图号排序,较低的视图号表示更早发生。
+
+在 Group Replication 中,视图更改是一个同步过程,有助于解决 FLP 不可能性问题,但引入了新的性能抖动问题。
+
+### 9.6.2 同时多个视图更改的问题
+
+下图显示了不同网络分区故障的情况[6]:
+
+![](../media/6d6657768e47e86b6522f6dd41a56ac2.png)
+
+图 9-28. 网络分区的类型。
+
+网络分区可以分为完全、部分和单工类型。当这些分区与触发视图更改的其他故障或命令相交时,会产生复杂的并发挑战。目前,Group Replication 缺乏有效的隔离措施来处理这些问题。
+
+以下是一些常见的并发视图更改问题:
+
+1. **force_members 命令**:此命令与网络抖动触发的视图更改不兼容。谨慎使用,特别是在严重的网络不稳定期间。
+2. **快速节点重启**:节点重启太快可能会导致视图混乱,如果它们在完全删除之前重新加入。Group Replication 试图解决这个问题,但问题仍然存在。
+3. **同时添加节点**:同时添加多个节点可能导致视图问题。
+4. **安装视图过程失败**:在安装视图过程中发生新故障可能会冻结整个集群。
+
+一些视图更改问题难以缓解,需要大量努力才能解决,特别是由于这一领域缺乏理论支持。
+
+对于 MySQL 节点在其信息完全删除之前尝试重新加入 Group Replication 集群,可能导致视图不一致的问题,解决方案涉及类似于 TCP 的 timewait 机制的措施:
+
+1. 当 Group Replication 集群检测到节点即将被删除时(使用 remove_node_type),它通知 Paxos 层暂时阻止节点重新加入。
+2. 在节点删除过程完成后,通常在安装视图操作之后,通知 Paxos 层节点可以继续申请加入集群。
+
+这种谨慎的过程有助于最大限度地减少由过早节点重新进入引起的视图相关问题。
+
+目前,与并发视图更改相关的问题(问题 2 和 3)已得到解决,但问题 1 和 4 仍然复杂,计划在未来解决。
+
+### 9.6.3 安装视图的同步问题
+
+视图更改过程比典型的 Paxos 交互更复杂。一旦在 Group Replication 集群中就视图更改达成共识,集群必须经历同步的"安装视图"过程。如果在安装期间出现问题,这种强同步可能会导致整个集群冻结。
+
+## 9.7 Group Replication 中的一致性问题
+
+### 9.7.1 Group Replication 中主切换期间的读一致性
+
+在单主组中,在主故障切换的情况下,当从节点被提升为主节点时,新主节点可以立即对应用程序流量可用,而不管复制积压有多大,或者可以限制对它的访问,直到积压被应用[13]。
+
+故障切换期间的一致性包括:
+
+- **RW 事务**:等待所有前面的事务完成后再应用。
+- **RO 事务**:在执行前等待前面的事务完成,确保它们读取最新数据。
+
+新选举的主节点上的新事务被保留,直到应用积压,保证客户端看到最新值。这种方法优先考虑一致性,但可能会引入延迟,具体取决于积压大小。
+
+为了优雅地解决主切换过程中读取脏数据的问题,可以实施以下措施:
+
+1. **加速回放速度**:增强 MySQL 从节点的回放速度,以确保它们尽快赶上主节点。这最大限度地减少了可能读取陈旧数据的窗口。
+2. **优化领导者选举**:在领导者选举期间,在 MySQL 从节点中选择回放进度最快的节点。这减少了主切换的等待时间,确保更快的转换和更及时的数据可用性。
+
+### 9.7.2 写操作中的一致性问题
+
+Group Replication 中的 'after' 机制旨在实现 MySQL 主节点和从节点之间的近乎完全同步,实现强同步。这需要在 Paxos 和回放级别都进行同步,导致更长的用户响应时间。选择这种强同步的用户应该意识到以下风险:
+
+1. 性能波动。
+2. 用户提交响应时间可能无法满足性能要求。
+
+'after' 机制目前还不成熟;在测试期间,许多实例显示 MySQL 节点长时间处于恢复状态。根本原因在于采用了新的票证机制来解决 'after' 问题,该机制过于复杂且效果不佳。
+
+在实际应用中,不建议使用基于 'after' 机制的强一致性写入。虽然这种机制确保不会丢失数据,但 CAP 定理规定此类机制不保证可用性。
+
+本书更倾向于并推荐基于 Paxos 日志持久化的机制。这些机制不仅提供更低和更可预测的响应时间,而且在可扩展性方面也远远超过 'after' 机制。下图比较了基于 'after' 的强同步机制和 Paxos 日志持久化机制在并发级别下 TPC-C 的吞吐量。
+
+<img src="../media/image-20240829111619905.png" alt="image-20240829111619905" style="zoom:150%;" />
+
+图 9-29. 具有 Paxos 日志持久化的 Group Replication 与强同步机制的对比。
+
+从图中可以看出,基于 Paxos 日志持久化的机制显著优于基于 'after' 的强同步机制。
+
+## 9.8 Group Replication 与其他复制机制的比较
+
+### 9.8.1 不同网络延迟条件下的比较测试
+
+MySQL 集群可以部署在各种环境中,了解每种环境的优缺点有助于做出明智的决策。在不同网络延迟条件下对四种解决方案进行了性能比较:异步复制、半同步复制、Group Replication 和具有 Paxos 日志持久化的 Group Replication,使用改进版本的 MySQL。
+
+下图比较了在 1ms 网络延迟场景下不同复制方案在不同并发级别下 SysBench 读/写测试的吞吐量:
+
+<img src="../media/image-20240829111645952.png" alt="image-20240829111645952" style="zoom:150%;" />
+
+图 9-30. 在 1ms 网络延迟下不同复制方案在不同并发级别下 SysBench 读/写测试的吞吐量比较。
+
+异步复制提供最佳吞吐量,因为它不需要 MySQL 从节点 ACK 确认,但它无法保证高可用性。Group Replication 通过在内存中的 Paxos 层实现共识并确保事务批量共识,提供了显著的优势,并显示出与半同步机制相比更好的性能。具有 Paxos 日志持久化的 Group Replication 显示出与 Group Replication 相似的性能,受益于 Paxos 条目的批处理和增强的 SSD 硬件性能。
+
+另一方面,半同步复制按顺序处理事件。由于事务涉及多个事件,它导致高 CPU 处理延迟。根据排队理论,与其他解决方案相比,半同步复制中的等待时间显著更高,导致吞吐量较差。
+
+下图显示了 4 种解决方案在不同并发级别下响应时间的比较。
+
+<img src="../media/image-20240829111711642.png" alt="image-20240829111711642" style="zoom:150%;" />
+
+图 9-31. 在 1ms 网络延迟下不同复制方案在不同并发级别下 SysBench 读/写测试的响应时间比较。
+
+从图中可以清楚地看到,半同步复制表现出最差的响应时间,而异步复制显示出最佳性能,这与预期一致。
+
+当网络延迟增加到 10ms 时,下图说明了具体的性能比较:
+
+<img src="../media/image-20240829111732678.png" alt="image-20240829111732678" style="zoom:150%;" />
+
+图 9-32. 在 10ms 网络延迟下不同复制方案在不同并发级别下 SysBench 读/写测试的吞吐量比较。
+
+从图中可以清楚地看到,异步复制提供最佳吞吐量。尽管网络延迟,它实现了显著更高的吞吐量并保持相对稳定的响应时间,使其成为跨城市或跨区域部署的首选。
+
+在具有长网络延迟(10ms)的场景中,对于半同步复制和 Group Replication,MySQL 从节点的处理延迟不是瓶颈。然而,由于其效率较低的事件处理机制,半同步复制在吞吐量方面落后于 Group Replication。
+
+同时,在 4 种不同解决方案的响应时间方面进行了比较。
+
+<img src="../media/image-20240829111753566.png" alt="image-20240829111753566" style="zoom:150%;" />
+
+图 9-33. 在 10ms 网络延迟下不同复制方案在不同并发级别下 SysBench 读/写测试的响应时间比较。
+
+从图中可以清楚地看到,在低并发级别下,异步复制具有最低的响应时间。然而,随着并发性的增加,异步复制和 Group Replication 之间的性能差距缩小。半同步复制在所有解决方案中始终显示出最高的响应时间。理论上,具有 Paxos 日志持久化的 Group Replication 可以完全替代半同步复制,在保留 Group Replication 的高可用性优势的同时提供改进的性能。
+
+### 9.8.2 具有 Paxos 日志持久化的 Group Replication 与其他复制方法
+
+在同一数据中心环境中,使用 BenchmarkSQL 进行 TPC-C 测试,比较半同步复制、具有 Paxos 日志持久化的 Group Replication 和异步复制在并发级别下的吞吐量。具体细节如下图所示:
+
+<img src="../media/image-20240829111911455.png" alt="image-20240829111911455" style="zoom:150%;" />
+
+图 9-34. 不同复制方案在不同并发级别下 BenchmarkSQL 测试的吞吐量比较。
+
+从图中可以清楚地看到,在同一数据中心环境中,异步复制实现了最高的吞吐量,尽管与 Group Replication 相比差异不大。用 Group Replication 牺牲一些性能以获得更高的可用性通常是值得的。与具有 Paxos 日志持久化的 Group Replication 相比,半同步复制在性能上明显落后。
+
+在易用性方面,半同步复制更简单,特别是在 MySQL 实例较少的情况下。然而,随着实例数量的增加,由于可能出现更多的边缘情况和故障,管理半同步复制变得更加复杂。
+
+## 9.9 Group Replication 的可扩展性
+
+Paxos 算法对多数同意的依赖减慢了决策制定,因为每个决策都需要往返许多参与者[29]。这种通信和同步成本引入了显著的开销,导致与非复制系统相比,状态机复制的请求率较低。
+
+在查看内容后,使用修改后的 tpcc-mysql 工具比较独立服务器和 Group Replication 设置之间的吞吐量。这种比较将有助于评估 Group Replication 能力的极限。
+
+<img src="../media/image-20240829111935904.png" alt="image-20240829111935904" style="zoom:150%;" />
+
+图 9-35. Group Replication 能力的极限。
+
+从图中可以清楚地看到,独立 MySQL 实例的吞吐量仍有提高的潜力。Group Replication 增加了额外的队列延迟,吞吐量在 200 并发时达到峰值。在当前硬件环境下,进一步提高吞吐量具有挑战性。
+
+Group Replication 面临吞吐量上限,受硬件能力、Paxos 的同步成本和 XCom 的单线程处理限制的影响。相比之下,独立 MySQL 显示出更好的可扩展性并实现了更高的吞吐量。
+
+让大多数参与者参与每个决策会给参与者和领导者之间的网络带来高负载。因此,系统通常限制为五个或七个参与者,因为每个额外的参与者都会显著降低整体性能[29]。
+
+Group Replication 的可扩展性随着节点数量的增加如何?由于底层 Paxos 通信基于单线程模型,理论上添加更多节点会削弱处理能力。在同一数据中心环境中,对 3 个节点、5 个节点、7 个节点和 9 个节点进行了集群测试,如下图所示:
+
+<img src="../media/image-20240829111959287.png" alt="image-20240829111959287" style="zoom:150%;" />
+
+图 9-36. Group Replication 在不同节点配置下的可扩展性。
+
+从图中可以看出,7 节点集群的吞吐量仍然可以接受,但与 7 节点相比,9 节点的吞吐量显著下降。这些测试是在同一数据中心环境中进行的,可能并不代表所有场景。然而,它突出了一个问题:随着节点数量的增加,Group Replication 的可扩展性可能会受到影响。
+
+[下一章](Chapter10.md)
